@@ -37,6 +37,13 @@ ocr = [
     "paddlepaddle==3.2.0",
     "paddleocr>=3.7",
 ]
+# Optional quantized MT path (mt.provider: nllb_ct2). CTranslate2 does not need
+# torch, but the NLLB tokenizer still comes from transformers + sentencepiece.
+ct2 = [
+    "ctranslate2>=4.4",
+    "transformers>=4.44,<5",
+    "sentencepiece>=0.2",
+]
 summarize = ["google-genai>=1.0"]
 dev = [
     "flask>=3.0",

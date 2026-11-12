@@ -12,7 +12,9 @@ screen pixels never leave the device, and only text reaches the cloud.
 On this workstation the machine default is `asr.backend: llama_cpp`: Qwen3-ASR
 runs as a GGUF model in a local `llama serve` process and captions get partial
 previews every 5 s. `http` (vLLM in WSL2) remains the report path.
-See [ASR backends](#asr-backends).
+See [ASR backends](#asr-backends). Translation defaults to `nllb_ct2`
+(CTranslate2 int8 on CPU, zero VRAM); see
+[Translation](#translation-nllb-200).
 
 Implementation status and the build order live in [AGENT.md](AGENT.md).
 
@@ -87,6 +89,50 @@ model.
 $env:TPDK__ASR__BACKEND = "http"     # vLLM service in WSL2
 .\.venv\Scripts\python.exe -m tpdk_overlay.server.app
 ```
+
+## Translation (NLLB-200)
+
+`mt.provider` selects how the same `facebook/nllb-200-distilled-600M`
+checkpoint runs. Only final transcripts and OCR blocks reach this stage; no
+audio or pixels are involved.
+
+| `mt.provider` | Runs as | Device | Dependency |
+|---|---|---|---|
+| `nllb_ct2` (default) | CTranslate2 int8 | CPU (zero VRAM), CUDA optional | `ct2` extra |
+| `nllb` | transformers, fp16 | CUDA when available, CPU float32 otherwise | `ml` extra |
+
+The default CT2 path keeps the 4 GB GPU free for ASR. The `ct2` extra and one
+conversion are required on first use (the output directory is gitignored):
+
+```powershell
+.\.venv\Scripts\pip.exe install -e ".[ct2]"
+.\.venv\Scripts\ct2-transformers-converter.exe `
+  --model facebook/nllb-200-distilled-600M `
+  --output_dir data/models/nllb-ct2 --quantization int8
+```
+
+If a conversion already exists (for example the old Live Subtitle prototype's
+`Live Subtitle/models/nllb-ct2`), point `mt.ct2.model` at that directory instead
+of re-converting.
+
+Then the default runs with no overrides. To use the optional GPU path instead:
+
+```powershell
+$env:TPDK__MT__PROVIDER = "nllb"
+$env:TPDK__MT__DEVICE = "cuda"
+.\.venv\Scripts\python.exe -m tpdk_overlay.server.app
+```
+
+`mt.batch_size` caps both sentence and OCR-block batches; `mt.max_new_tokens`
+bounds the translation length, not the input (`mt.max_input_tokens` truncates
+long inputs).
+
+Measured on this workstation (RTX 3050 4 GB, Ryzen 5 5600H, 8 lecture
+sentences): the default `nllb_ct2` int8 on CPU has p50 ≈ 0.79–0.84 s/sentence
+at 1.46 GB RAM and zero VRAM; `nllb` fp16 on CUDA has p50 ≈ 0.46–0.49 s/sentence
+at 1.22 GB VRAM and 1.73 GB RAM; `nllb` fp32 on CPU is ≈ 2.3 s/sentence at
+3.2 GB RAM. The CT2 default keeps the GPU with ASR; use `nllb` on CUDA when
+there is VRAM headroom. See AGENT.md §7 for the full table.
 
 ## First-time setup
 

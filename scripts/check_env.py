@@ -39,9 +39,10 @@ CORE_MODULES = [
 ]
 
 OPTIONAL_MODULES = {
-    "torch": "NLLB translation (GPU)",
-    "transformers": "NLLB translation",
+    "torch": "NLLB transformers path (optional GPU)",
+    "transformers": "NLLB tokenizer / transformers path",
     "sentencepiece": "NLLB tokenizer",
+    "ctranslate2": "default MT (nllb_ct2 int8)",
     "silero_vad": "voice activity detection",
     "paddle": "PP-OCRv6 runtime",
     "paddleocr": "slide OCR",
@@ -117,7 +118,11 @@ def _check_torch(config: AppConfig | None) -> None:
     except Exception:  # noqa: BLE001 - already reported by import check
         return
     cuda = torch.cuda.is_available()
-    wants_cuda = config is not None and config.mt.device.startswith("cuda")
+    wants_cuda = (
+        config is not None
+        and config.mt.provider == "nllb"
+        and config.mt.device.startswith("cuda")
+    )
     if cuda:
         _line("OK", f"torch {torch.__version__} cuda=True")
         _line("OK", f"GPU: {torch.cuda.get_device_name(0)}")
@@ -131,8 +136,12 @@ def _check_torch(config: AppConfig | None) -> None:
             "uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130",
         )
     else:
-        warnings.append("cuda")
-        _line("WARN", f"torch {torch.__version__} cuda=False (mt.device={config.mt.device})")
+        provider = config.mt.provider if config is not None else "unknown"
+        _line(
+            "OK",
+            f"torch {torch.__version__} cuda=False "
+            f"(not required for mt.provider={provider})",
+        )
 
 
 def _check_audio() -> None:
@@ -199,12 +208,34 @@ def _check_asr(base_url: str) -> None:
         _line("WARN", f"ASR service not reachable at {base_url}: {exc}")
 
 
+def _check_mt(config: AppConfig | None) -> None:
+    if config is None or config.mt.provider != "nllb_ct2":
+        return
+    try:
+        import ctranslate2  # noqa: F401 - presence is reported by the import check
+    except Exception:  # noqa: BLE001
+        return
+    model_dir = config.resolve(Path(config.mt.ct2.model))
+    model_bin = model_dir / "model.bin"
+    if model_bin.is_file():
+        _line("OK", f"CTranslate2 NLLB model: {model_dir}")
+    else:
+        warnings.append("ct2-model")
+        _line(
+            "WARN",
+            f"CTranslate2 NLLB model missing at {model_bin}; convert it with "
+            "ct2-transformers-converter --model facebook/nllb-200-distilled-600M "
+            "--output_dir data/models/nllb-ct2 --quantization int8",
+        )
+
+
 def main() -> int:
     print(f"Project root: {PROJECT_ROOT}")
     _check_python()
     _check_imports()
     config = _check_config()
     _check_torch(config)
+    _check_mt(config)
     _check_audio()
     if config is not None:
         _check_port(config.server.host, config.server.port)

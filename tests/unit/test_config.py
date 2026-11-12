@@ -20,6 +20,10 @@ def test_default_config_loads() -> None:
     assert config.asr.llama_cpp.partial_tail_sec == 4.0
     assert config.asr.llama_cpp.min_energy_dbfs == -40.0
     assert config.ocr.det_model == "PP-OCRv6_small_det"
+    assert config.mt.provider == "nllb_ct2"
+    assert config.mt.device == "cpu"
+    assert config.mt.ct2.model == "data/models/nllb-ct2"
+    assert config.mt.ct2.compute_type == "int8"
     assert config.data_dir == project_root() / "data"
 
 

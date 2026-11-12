@@ -96,13 +96,38 @@ class AsrConfig(_Section):
     llama_cpp: LlamaCppAsrConfig = LlamaCppAsrConfig()
 
 
+class MtCt2Config(_Section):
+    """CTranslate2 conversion of the same NLLB checkpoint (int8 by default)."""
+
+    model: str = "data/models/nllb-ct2"
+    compute_type: Literal[
+        "int8",
+        "int8_float32",
+        "int8_float16",
+        "int8_bfloat16",
+        "int16",
+        "float16",
+        "bfloat16",
+        "float32",
+    ] = "int8"
+    max_new_tokens: int = Field(default=256, gt=0)
+
+
 class MtConfig(_Section):
+    """Translation defaults to CTranslate2 int8 on CPU (zero VRAM).
+
+    Set ``provider: nllb`` and ``device: cuda`` for the optional transformers
+    fp16 GPU path.
+    """
+
+    provider: Literal["nllb", "nllb_ct2"] = "nllb_ct2"
     model: str = "facebook/nllb-200-distilled-600M"
-    device: str = "cuda"
+    device: str = "cpu"
     dtype: Literal["float16", "bfloat16", "float32"] = "float16"
     max_input_tokens: int = Field(default=512, gt=0)
     max_new_tokens: int = Field(default=256, gt=0)
     batch_size: int = Field(default=8, gt=0)
+    ct2: MtCt2Config = MtCt2Config()
 
 
 class ScreenConfig(_Section):
@@ -261,6 +286,7 @@ __all__ = [
     "LanguageConfig",
     "LlamaCppAsrConfig",
     "MtConfig",
+    "MtCt2Config",
     "OcrConfig",
     "OcrOverlayConfig",
     "ScreenConfig",

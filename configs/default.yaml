@@ -48,12 +48,19 @@ asr:
     system_prompt: ""          # experimental; empty = no system message
 
 mt:
+  # Default: CTranslate2 int8 on CPU (zero VRAM; keeps the 4 GB GPU for ASR).
+  # nllb = transformers fp16 GPU path; set device: cuda when switching.
+  provider: nllb_ct2
   model: facebook/nllb-200-distilled-600M
-  device: cuda
-  dtype: float16
+  device: cpu
+  dtype: float16        # nllb only; CPU inference is forced to float32
   max_input_tokens: 512
   max_new_tokens: 256
   batch_size: 8
+  ct2:                  # used only when provider: nllb_ct2
+    model: data/models/nllb-ct2
+    compute_type: int8
+    max_new_tokens: 256
 
 screen:
   enabled: true
