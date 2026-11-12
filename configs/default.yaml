@@ -119,3 +119,4 @@ ui:
     font_family: Segoe UI
     font_size: 18
   click_through: true
+  auto_start: true        # start the session as soon as the overlay connects

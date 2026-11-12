@@ -350,6 +350,129 @@ def test_caption_does_not_mark_first_final_translation(qt_app: QApplication) -> 
         window.close()
 
 
+def test_caption_keeps_previous_final_above_new_utterance(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=0)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    window.show()
+    qt_app.processEvents()
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First sentence",
+                "Kalimat pertama",
+                TranslationStatus.OK,
+            )
+        )
+        assert window.previous_text() == ("", "")
+
+        window.show_segment(event(2, 1, SegmentStatus.PARTIAL, "Second sentence"))
+        assert window.previous_text() == ("First sentence", "Kalimat pertama")
+        assert window.current_text() == ("Second sentence", "")
+        assert window._previous_source_label.isVisible()
+        assert window._previous_translation_label.isVisible()
+
+        # A newer partial must not overwrite the retained final.
+        window.show_segment(event(3, 1, SegmentStatus.PARTIAL, "Third sentence"))
+        assert window.previous_text() == ("First sentence", "Kalimat pertama")
+
+        window.show_segment(
+            event(
+                3,
+                2,
+                SegmentStatus.FINAL,
+                "Third sentence",
+                "Kalimat ketiga",
+                TranslationStatus.OK,
+            )
+        )
+        assert window.previous_text() == ("First sentence", "Kalimat pertama")
+
+        # The completed third utterance becomes the previous row for the fourth.
+        window.show_segment(event(4, 1, SegmentStatus.PARTIAL, "Fourth sentence"))
+        assert window.previous_text() == ("Third sentence", "Kalimat ketiga")
+        assert window.current_text() == ("Fourth sentence", "")
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_caption_previous_final_skips_translation_placeholder(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=0)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    window.show()
+    qt_app.processEvents()
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(event(1, 2, SegmentStatus.FINAL, "First sentence"))
+        window.show_segment(event(2, 1, SegmentStatus.PARTIAL, "Second sentence"))
+        assert window.previous_text() == ("First sentence", "")
+        assert window._previous_source_label.isVisible()
+        assert not window._previous_translation_label.isVisible()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_caption_marks_new_translation_preview(qt_app: QApplication) -> None:
     window = CaptionWindow(
         UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300

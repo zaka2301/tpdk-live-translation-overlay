@@ -233,6 +233,7 @@ class OverlayApp(QObject):
         self._state = SessionState.IDLE
         self._session_id: str | None = None
         self._click_through = bool(config.ui.click_through)
+        self._auto_start_pending = bool(config.ui.auto_start)
         self._picker: RegionPicker | None = None
 
         self._caption = CaptionWindow(
@@ -324,6 +325,10 @@ class OverlayApp(QObject):
         if self._session_active():
             self._send(SessionStopCommand())
             return
+        self._start_session()
+
+    def _start_session(self) -> None:
+        self._auto_start_pending = False
         self._send(
             SessionStartCommand(
                 source_lang=self._source_lang,
@@ -418,6 +423,17 @@ class OverlayApp(QObject):
             self._history.set_session(event.session_id)
         self._caption.set_session_state(event.state)
         self._update_actions()
+        self._maybe_auto_start(event.state)
+
+    def _maybe_auto_start(self, state: SessionState) -> None:
+        """Start once on launch if the backend has no active session."""
+
+        if not self._auto_start_pending:
+            return
+        self._auto_start_pending = False
+        if state in (SessionState.IDLE, SessionState.STOPPED):
+            logger.info("auto-starting session after backend connection")
+            self._start_session()
 
     def _ack(self, event: TranscriptSegmentEvent) -> None:
         """Report the paint time for NFR-01 when a final was actually shown."""

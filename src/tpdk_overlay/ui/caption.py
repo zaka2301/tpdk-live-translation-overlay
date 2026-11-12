@@ -41,6 +41,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -339,6 +340,11 @@ class CaptionWindow(QWidget):
         self._full_source = ""
         self._full_translation = ""
         self._segment_final = False
+        self._current_translation_ready = False
+        self._previous_source_full = ""
+        self._previous_translation_full = ""
+        self._shown_previous_source = ""
+        self._shown_previous_translation = ""
         self._revisions: dict[int, int] = {}
         self._mark_segment_id: int | None = None
         self._shown_source_plain = ""
@@ -434,6 +440,54 @@ class CaptionWindow(QWidget):
         row.addStretch(1)
         layout.addWidget(self._controls)
 
+        previous_source_font = theme.font(
+            family, max(10, caption.font_size - 4), weight=QFont.Weight.Medium
+        )
+        self._previous_source_label = CaptionLabel("", self)
+        self._previous_source_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._previous_source_label.setWordWrap(True)
+        self._previous_source_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self._previous_source_label.setFont(previous_source_font)
+        self._previous_source_label.setStyleSheet(
+            f"color: {theme.rgba(theme.SOURCE_TEXT, 0.62)};"
+        )
+        self._previous_source_label.setMaximumHeight(
+            QFontMetrics(previous_source_font).lineSpacing() + 4
+        )
+        self._previous_source_label.setVisible(False)
+        layout.addWidget(self._previous_source_label)
+
+        previous_translation_font = theme.font(
+            family,
+            max(11, caption.translation_font_size - 2),
+            weight=QFont.Weight.DemiBold,
+        )
+        self._previous_translation_label = CaptionLabel("", self)
+        self._previous_translation_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._previous_translation_label.setWordWrap(True)
+        self._previous_translation_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self._previous_translation_label.setFont(previous_translation_font)
+        self._previous_translation_label.setStyleSheet(
+            f"color: {theme.rgba(theme.TRANSLATION_TEXT, 0.74)};"
+        )
+        self._previous_translation_label.setMaximumHeight(
+            QFontMetrics(previous_translation_font).lineSpacing() * 2 + 4
+        )
+        self._previous_translation_label.setVisible(False)
+        layout.addWidget(self._previous_translation_label)
+
+        self._previous_divider = QFrame(self)
+        self._previous_divider.setFixedHeight(1)
+        self._previous_divider.setStyleSheet(
+            f"background: {theme.rgba(theme.BORDER, 0.55)}; border: none;"
+        )
+        self._previous_divider.setVisible(False)
+        layout.addWidget(self._previous_divider)
+
         self._source_label = CaptionLabel("", self)
         self._source_label.setTextFormat(Qt.TextFormat.PlainText)
         self._source_label.setWordWrap(True)
@@ -491,6 +545,11 @@ class CaptionWindow(QWidget):
 
         return self._shown_source_plain, self._shown_translation_plain
 
+    def previous_text(self) -> tuple[str, str]:
+        """Displayed previous final (source, translation); may be empty."""
+
+        return self._shown_previous_source, self._shown_previous_translation
+
     def set_source_language(self, code: str) -> None:
         self._select_language(self._source_combo, code)
 
@@ -541,8 +600,19 @@ class CaptionWindow(QWidget):
         self._full_source = ""
         self._full_translation = ""
         self._segment_final = False
+        self._current_translation_ready = False
+        self._previous_source_full = ""
+        self._previous_translation_full = ""
+        self._shown_previous_source = ""
+        self._shown_previous_translation = ""
+        self._mark_segment_id = None
         self._source_label.clear()
         self._translation_label.clear()
+        self._previous_source_label.clear()
+        self._previous_translation_label.clear()
+        self._previous_source_label.setVisible(False)
+        self._previous_translation_label.setVisible(False)
+        self._previous_divider.setVisible(False)
 
     def show_segment(self, event: TranscriptSegmentEvent) -> None:
         """Apply a partial/final, or queue it while a final is being read.
@@ -595,6 +665,7 @@ class CaptionWindow(QWidget):
 
         final = event.status is SegmentStatus.FINAL
         if self._mark_segment_id != event.segment_id:
+            self._promote_previous_final()
             self._mark_segment_id = event.segment_id
             self._shown_source_plain = ""
             self._shown_translation_plain = ""
@@ -602,6 +673,7 @@ class CaptionWindow(QWidget):
             self._source_mark_ranges = []
             self._translation_mark_ranges = []
         self._segment_final = final
+        self._current_translation_ready = bool(event.translation)
         source_font = self._source_label.font()
         source_font.setItalic(not final)
         self._source_label.setFont(source_font)
@@ -621,6 +693,49 @@ class CaptionWindow(QWidget):
             self.finalPainted.emit(event)
             if self._is_translated_final(event):
                 self._start_hold()
+
+    def _promote_previous_final(self) -> None:
+        """Keep the last final above the next utterance for continued reading."""
+
+        if not self._segment_final or not self._full_source:
+            return
+        self._previous_source_full = self._full_source
+        self._previous_translation_full = (
+            self._full_translation if self._current_translation_ready else ""
+        )
+        self._apply_previous_text()
+
+    def _apply_previous_text(self) -> None:
+        source = self._previous_source_full
+        translation = self._previous_translation_full
+        self._previous_source_label.setVisible(bool(source))
+        self._previous_translation_label.setVisible(bool(translation))
+        self._previous_divider.setVisible(bool(source or translation))
+        if self.layout() is not None:
+            self.layout().activate()
+        if source:
+            self._shown_previous_source = self._fit_text(
+                self._previous_source_label,
+                source,
+                keep_tail=False,
+                max_height=self._previous_source_label.maximumHeight(),
+            )
+        else:
+            self._shown_previous_source = ""
+            self._previous_source_label.clear()
+        if self.layout() is not None:
+            self.layout().invalidate()
+            self.layout().activate()
+        if translation:
+            self._shown_previous_translation = self._fit_text(
+                self._previous_translation_label,
+                translation,
+                keep_tail=False,
+                max_height=self._previous_translation_label.maximumHeight(),
+            )
+        else:
+            self._shown_previous_translation = ""
+            self._previous_translation_label.clear()
 
     def _start_hold(self) -> None:
         if self._final_hold_ms <= 0:
@@ -821,6 +936,9 @@ class CaptionWindow(QWidget):
     def paint_now(self) -> None:
         """Force an immediate paint so a render ack carries a real timestamp."""
 
+        self._previous_source_label.repaint()
+        self._previous_translation_label.repaint()
+        self._previous_divider.repaint()
         self._source_label.repaint()
         self._translation_label.repaint()
         self._status_label.repaint()
@@ -867,12 +985,14 @@ class CaptionWindow(QWidget):
         super().resizeEvent(event)
         self._grip.move(self.width() - GRIP_SIZE - 2, self.height() - GRIP_SIZE - 2)
         if hasattr(self, "_source_label"):
+            self._apply_previous_text()
             self._apply_fitted_text()
 
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
         # Re-fit after a hidden window is shown; show() is not guaranteed to
         # emit resizeEvent when the geometry did not change.
+        self._apply_previous_text()
         self._apply_fitted_text()
 
     def paintEvent(self, event: object) -> None:  # noqa: N802 - Qt naming

@@ -214,6 +214,7 @@ class UiConfig(_Section):
     caption: CaptionConfig = CaptionConfig()
     ocr_overlay: OcrOverlayConfig = OcrOverlayConfig()
     click_through: bool = True
+    auto_start: bool = True
 
 
 class AppConfig(_Section):
