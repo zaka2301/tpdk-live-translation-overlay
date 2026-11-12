@@ -44,11 +44,11 @@ def test_invalid_command_returns_notice() -> None:
         assert notice["code"] == "invalid_command"
 
 
-def test_unwired_command_returns_notice() -> None:
+def test_stop_without_session_returns_notice() -> None:
     client = TestClient(create_app())
     with client.websocket_connect("/ws") as ws:
         ws.receive_text()
         ws.send_text(json.dumps({"type": "session.stop"}))
         notice = json.loads(ws.receive_text())
         assert notice["type"] == "notice"
-        assert notice["code"] == "command_unavailable"
+        assert notice["code"] == "session_not_running"

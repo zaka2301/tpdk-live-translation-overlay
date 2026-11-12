@@ -1,87 +1,67 @@
 """Backend surface: REST health check plus the WebSocket command/event channel.
 
-The session orchestrator is not wired yet. This module fixes the transport and
-protocol behavior (connect -> idle state, ping -> pong, unknown command ->
-notice) so the UI and adapters can be developed against a stable surface.
-AGENT.md phase 3 replaces :func:`_dispatch` with the real orchestrator.
+The transport is fixed here (one ``/ws`` for commands and events, REST only for
+health); :class:`~tpdk_overlay.pipeline.orchestrator.Orchestrator` owns the
+pipeline. ``create_app`` accepts a ``ports_factory`` so integration tests inject
+fake adapters without a GPU or a running ASR service.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pydantic import ValidationError
+from fastapi import FastAPI, WebSocket
 
 from tpdk_overlay import __version__
 from tpdk_overlay.config import AppConfig, load_config
-from tpdk_overlay.contracts import (
-    PROTOCOL_VERSION,
-    ClientCommand,
-    NoticeEvent,
-    PingCommand,
-    PongEvent,
-    SessionState,
-    SessionStateEvent,
-    parse_client_command,
-)
+from tpdk_overlay.contracts import PROTOCOL_VERSION
+from tpdk_overlay.pipeline.events import EventBus
+from tpdk_overlay.pipeline.orchestrator import Orchestrator, PipelinePorts
+from tpdk_overlay.server.ws import ConnectionManager
 from tpdk_overlay.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
-
-async def _dispatch(socket: WebSocket, command: ClientCommand) -> None:
-    if isinstance(command, PingCommand):
-        await socket.send_text(PongEvent(echo_ts_ms=command.client_ts_ms).model_dump_json())
-        return
-    logger.warning("command not wired: %s", command.type)
-    await socket.send_text(
-        NoticeEvent(
-            level="info",
-            code="command_unavailable",
-            message=(
-                f"{command.type} is not wired yet; the pipeline lands in AGENT.md phase 3"
-            ),
-        ).model_dump_json()
-    )
+PortsFactory = Callable[[AppConfig], PipelinePorts]
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
+def create_app(
+    config: AppConfig | None = None,
+    *,
+    ports_factory: PortsFactory | None = None,
+) -> FastAPI:
     cfg = config or load_config()
-    app = FastAPI(title="TPdK Overlay Backend", version=__version__)
+    bus = EventBus()
+    orchestrator = Orchestrator(cfg, bus=bus, ports_factory=ports_factory)
+    connections = ConnectionManager(bus, orchestrator)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        await orchestrator.shutdown()
+
+    app = FastAPI(title="TPdK Overlay Backend", version=__version__, lifespan=lifespan)
     app.state.config = cfg
+    app.state.bus = bus
+    app.state.orchestrator = orchestrator
+    app.state.connections = connections
 
     @app.get("/api/health")
-    def health() -> dict[str, object]:
+    def health() -> dict[str, Any]:
         return {
             "status": "ok",
             "version": __version__,
             "protocol": PROTOCOL_VERSION,
-            "state": SessionState.IDLE.value,
+            "state": orchestrator.state.value,
+            "session_id": orchestrator.session_id,
         }
 
     @app.websocket("/ws")
     async def ws(socket: WebSocket) -> None:
-        await socket.accept()
-        await socket.send_text(SessionStateEvent(state=SessionState.IDLE).model_dump_json())
-        try:
-            while True:
-                raw = await socket.receive_text()
-                try:
-                    command = parse_client_command(raw)
-                except ValidationError as exc:
-                    first = exc.errors()[0].get("msg", "invalid command")
-                    await socket.send_text(
-                        NoticeEvent(
-                            level="warning",
-                            code="invalid_command",
-                            message=str(first),
-                        ).model_dump_json()
-                    )
-                    continue
-                await _dispatch(socket, command)
-        except WebSocketDisconnect:
-            return
+        await connections.serve(socket)
 
     return app
 
@@ -100,3 +80,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = ["ConnectionManager", "create_app", "main"]
