@@ -7,8 +7,10 @@ endpoint and parses the ``language <NAME><asr_text>transcription`` reply. No
 torch or transformers is needed in this process, which makes this the machine
 default backend. The server always auto-detects the language.
 
-Partials are previews over the recent audio tail every ``partial_interval_ms``
-and are replaced by the final, which transcribes the whole utterance.
+Partials are cumulative previews of the utterance so far, posted every
+``partial_interval_ms``; each preview replaces the previous one. Set
+``partial_tail_sec`` above zero to preview only the recent tail instead. The
+final always transcribes the whole utterance.
 """
 
 from __future__ import annotations
@@ -402,6 +404,10 @@ class _LlamaCppAsrStream:
         self._since_partial = 0
 
     def _tail_window(self) -> np.ndarray:
+        if self._llama.partial_tail_sec <= 0:
+            # Cumulative preview: the model sees everything heard so far, so
+            # successive previews grow instead of replacing unrelated tails.
+            return self._buffer
         tail = max(1, int(round(self._llama.partial_tail_sec * SAMPLE_RATE_16K)))
         return self._buffer[-tail:]
 

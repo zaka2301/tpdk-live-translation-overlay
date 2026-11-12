@@ -442,8 +442,13 @@ class CaptionWindow(QWidget):
         """
 
         last = self._revisions.get(event.segment_id)
-        if last is not None and event.revision <= last:
-            return
+        if last is not None:
+            if event.revision < last:
+                return
+            if event.revision == last and not self._is_partial_enrichment(event):
+                # A source preview owns its revision; only the translation of
+                # that same preview may update it in place.
+                return
         self._revisions[event.segment_id] = event.revision
         if len(self._revisions) > 64:
             cutoff = event.segment_id - 32
@@ -528,6 +533,14 @@ class CaptionWindow(QWidget):
         pending = self._pending
         if pending is None or event.segment_id >= pending.segment_id:
             self._pending = event
+
+    @staticmethod
+    def _is_partial_enrichment(event: TranscriptSegmentEvent) -> bool:
+        return (
+            event.status is SegmentStatus.PARTIAL
+            and event.translation_status is TranslationStatus.OK
+            and bool(event.translation)
+        )
 
     @staticmethod
     def _is_resolved_final(event: TranscriptSegmentEvent) -> bool:

@@ -23,7 +23,7 @@ audio:
     threshold: 0.5
     min_speech_ms: 250
     min_silence_ms: 450
-    max_utterance_ms: 8000  # hard subtitle cap; longer speech becomes a new segment
+    max_utterance_ms: 12000  # hard subtitle cap; longer speech becomes a new segment
     pre_roll_ms: 300
 
 asr:
@@ -42,8 +42,8 @@ asr:
     #     -ngl all -c 4096 -np 1 -n 128 --cache-type-k q8_0 --cache-type-v q8_0
     base_url: http://127.0.0.1:8081
     max_new_tokens: 128        # hard cap per request; partial previews use min(64, this)
-    partial_interval_ms: 2000  # preview cadence over the last partial_tail_sec of audio
-    partial_tail_sec: 4.0      # partial prompt window; kept short to bound latency
+    partial_interval_ms: 3000  # preview cadence
+    partial_tail_sec: 0.0      # 0 = preview the whole utterance so far (cumulative); >0 = last N seconds only
     min_energy_dbfs: -40.0     # windows quieter than this never reach the server
     system_prompt: ""          # experimental; empty = no system message
 
@@ -59,6 +59,7 @@ mt:
   max_input_tokens: 512
   max_new_tokens: 256
   batch_size: 8
+  translate_partials: true  # translate each source preview (finals still take priority)
   ct2:                  # used only when provider: nllb_ct2
     model: data/models/nllb-ct2
     compute_type: int8
@@ -106,7 +107,7 @@ ui:
     width: 1200
     height: 300           # fits ~3-4 translation lines at the default font
     anchor: bottom-center
-    opacity: 0.30
+    opacity: 0.50
     font_family: Segoe UI
     font_size: 15
     translation_font_size: 15
@@ -114,7 +115,7 @@ ui:
   ocr_overlay:
     enabled: true
     background: "#101418"
-    opacity: 0.92
+    opacity: 0.40
     font_family: Segoe UI
     font_size: 14
   click_through: true

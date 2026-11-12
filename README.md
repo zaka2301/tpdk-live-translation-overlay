@@ -11,8 +11,8 @@ calls the cloud (Gemini API). Audio and screen pixels never leave the device,
 and only text reaches the cloud.
 
 On this workstation the machine default is `asr.backend: llama_cpp`: Qwen3-ASR
-runs as a GGUF model in a local `llama serve` process and captions get partial
-previews every 5 s. `http` (vLLM in WSL2) remains the report path.
+runs as a GGUF model in a local `llama serve` process and captions get cumulative
+previews every 2 s. `http` (vLLM in WSL2) remains the report path.
 See [ASR backends](#asr-backends). Translation defaults to `plamo_llama`:
 PLaMo-3-Translate 0.8B GGUF on the GPU behind a second `llama serve` process;
 see [Translation](#translation-plamo--nllb-200).
@@ -96,7 +96,7 @@ line shows `backend offline - retrying` in the meantime.
 
 | `asr.backend` | Runs in | Partials | Requires |
 |---|---|---|---|
-| `llama_cpp` (default on this machine) | local `llama serve` process, GGUF, `127.0.0.1:8081` | yes, every 5 s over the last 4 s of audio | official llama CLI (`llama` on `PATH`; install with `irm https://llama.app/install.ps1 \| iex`), Qwen3-ASR-0.6B-GGUF (~1.8 GiB total measured) |
+| `llama_cpp` (default on this machine) | local `llama serve` process, GGUF, `127.0.0.1:8081` | yes, cumulative every 2 s (whole utterance so far) | official llama CLI (`llama` on `PATH`; install with `irm https://llama.app/install.ps1 \| iex`), Qwen3-ASR-0.6B-GGUF (~1.8 GiB total measured) |
 | `http` (report default) | WSL2 Ubuntu + vLLM service, `127.0.0.1:8000` | yes, streaming | `scripts/setup_asr_wsl.sh`, service running |
 
 `llama_cpp` needs no torch or transformers for ASR: the backend posts each
@@ -131,17 +131,19 @@ greedy repetition loops, and `asr.llama_cpp.max_new_tokens` stays at 128
 client-side (partials use 64).
 
 Language is always auto-detected by the server: `asr.language` is ignored by
-this backend (the adapter logs a warning if it is set). Partials preview the
-tail of the current utterance every `asr.llama_cpp.partial_interval_ms` (5000 ms
-by default); the final pass transcribes the whole utterance. Windows quieter
-than `asr.llama_cpp.min_energy_dbfs` (-40 dBFS) never reach the server, and
-music/silence hallucinations plus repetition-loop outputs are dropped.
-Measured here with the 0.6B Q8_0 server: repeated live backend smoke on
-5.1 s, 16.2 s, and 25.6 s clips returned finals in 0.26 s, 0.62 s, and 0.96 s
-after utterance end (across runs, ~0.3–1.4 s); previews land at 5/10/15/20/25 s
-of audio. `nvidia-smi` showed ~1.8 GiB total with the server loaded. The first
-preview still arrives near 5 s of audio, so this is a chunked preview, not
-NFR-02's ≤1 s first-partial target.
+this backend (the adapter logs a warning if it is set). Partials are cumulative
+previews of the utterance so far, re-transcribed every
+`asr.llama_cpp.partial_interval_ms` (2000 ms by default); each new preview grows
+the caption in place, and the final pass transcribes the whole utterance. Set
+`asr.llama_cpp.partial_tail_sec` above zero to preview only the recent tail
+instead. Windows quieter than `asr.llama_cpp.min_energy_dbfs` (-40 dBFS) never
+reach the server, and music/silence hallucinations plus repetition-loop outputs
+are dropped.
+Measured here with the 0.6B Q8_0 server on the 4 s and 8 s lecture clips:
+2/4/6/8 s cumulative previews cost 0.17/0.21/0.24/0.35 s of server time, and
+the final costs 0.20–0.33 s. `nvidia-smi` showed ~1.8 GiB total with the server
+loaded. The first preview still arrives at ~2 s of audio, so this is a chunked
+preview, not NFR-02's ≤1 s first-partial target.
 
 `http` is the report's streaming service. It runs in WSL2 and shares the 4 GB
 GPU with the translation model; if VRAM is tight, prefer `llama_cpp` or a
@@ -192,6 +194,13 @@ cannot be selected. Unsupported pairs fail per segment and leave the source
 text visible. Always pass
 `source_lang`/`target_lang`: omitting `target_lang` makes the model switch
 between Japanese and English.
+
+`mt.translate_partials` (default on) also translates each source preview. The
+MT worker keeps only the newest preview per segment and processes previews only
+while the final queue is idle, so finals keep priority. On this machine PLaMo
+translates a cumulative preview in ~0.09–0.23 s, which fits the 2 s preview
+cadence with plenty of headroom. A translated partial reuses its source
+revision and updates the caption in place; the final still replaces it.
 
 To use the CPU fallback instead:
 

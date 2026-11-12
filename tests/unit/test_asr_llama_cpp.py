@@ -63,6 +63,10 @@ def _wav_info(encoded: str) -> tuple[int, int, int, int]:
         )
 
 
+def _payload_audio(payload: dict[str, Any]) -> str:
+    return payload["messages"][0]["content"][0]["input_audio"]["data"]
+
+
 @pytest.mark.parametrize("body", [{"status": "ok"}, {}])
 def test_warmup_accepts_ok_or_missing_status(body: dict[str, Any]) -> None:
     seen: list[httpx.Request] = []
@@ -170,6 +174,28 @@ def test_partial_preview_then_final_uses_whole_utterance() -> None:
     assert full["max_tokens"] == 128
     frames = full["messages"][0]["content"][0]["input_audio"]["data"]
     assert _wav_info(frames) == (1, 2, 16_000, 24_000)
+    client.close()
+
+
+def test_zero_tail_previews_the_whole_utterance() -> None:
+    server = _FakeLlamaServer()
+    client = _client(
+        httpx.MockTransport(server),
+        partial_interval_ms=1000,
+        partial_tail_sec=0.0,
+    )
+    stream = client.open()
+
+    stream.push(_loud(8_000))
+    assert server.payloads == []
+
+    stream.push(_loud(8_000))
+    assert len(server.payloads) == 1
+    assert _wav_info(_payload_audio(server.payloads[0])) == (1, 2, 16_000, 16_000)
+
+    stream.push(_loud(16_000))
+    assert len(server.payloads) == 2
+    assert _wav_info(_payload_audio(server.payloads[1])) == (1, 2, 16_000, 32_000)
     client.close()
 
 

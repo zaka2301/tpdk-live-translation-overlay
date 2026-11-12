@@ -124,7 +124,10 @@ class TranscriptSegmentEvent(Event):
     """One ASR segment, revised in place until ``status == "final"``.
 
     ``segment_id`` identifies the utterance; ``revision`` increases for every
-    replacement. ``translation`` is filled once the MT adapter returns.
+    source replacement. A translated partial reuses its source revision (the
+    same revision is enriched in place), so no preview update is lost when the
+    translation lags behind. ``translation`` is filled once the MT adapter
+    returns.
     """
 
     type: Literal["transcript.segment"] = "transcript.segment"

@@ -79,7 +79,7 @@ class LlamaCppAsrConfig(_Section):
     base_url: str = "http://127.0.0.1:8081"
     max_new_tokens: int = Field(default=128, gt=0)
     partial_interval_ms: int = Field(default=2000, gt=0)
-    partial_tail_sec: float = Field(default=4.0, gt=0)
+    partial_tail_sec: float = Field(default=0.0, ge=0.0)
     min_energy_dbfs: float = -40.0
     system_prompt: str = ""
 
@@ -144,6 +144,10 @@ class MtConfig(_Section):
     max_input_tokens: int = Field(default=512, gt=0)
     max_new_tokens: int = Field(default=256, gt=0)
     batch_size: int = Field(default=8, gt=0)
+    # Translate each source preview as it arrives, not only the final. The MT
+    # worker translates previews only while the final queue is idle and keeps
+    # just the newest preview per segment, so finals always take priority.
+    translate_partials: bool = True
     ct2: MtCt2Config = MtCt2Config()
     plamo_llama: PlamoMtConfig = PlamoMtConfig()
 

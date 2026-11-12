@@ -81,6 +81,7 @@ _ASR_QUEUE_SIZE = 8
 _MT_QUEUE_SIZE = 64
 _STOP_BUDGET_S = 3.0
 _PUT_BUDGET_S = 5.0
+_MT_POLL_S = 0.2
 _OCR_IDLE_WAIT_S = 0.2
 # Send audio to the ASR worker in 0.25 s chunks instead of 32 ms frames: a
 # bounded queue then holds ~2 s of audio before it applies backpressure.
@@ -127,6 +128,7 @@ class SessionSettings:
     region: ScreenRegion | None = None
     ocr_enabled: bool = True
     screen_enabled: bool = True
+    translate_partials: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +162,7 @@ class _TranslationJob:
     target_lang: str
     asr_latency_ms: int
     audio_end_to_text_ms: int
+    partial: bool = False
 
 
 def build_default_ports(
@@ -268,6 +271,9 @@ class Orchestrator:
         self._revision_lock = threading.Lock()
         self._partial_lock = threading.Lock()
         self._pending_partials: dict[int, TranscriptSegmentEvent] = {}
+        self._partial_job_lock = threading.Lock()
+        self._partial_jobs: dict[int, _TranslationJob] = {}
+        self._current_segment_id: int | None = None
 
         self._records_lock = threading.Lock()
         self._final_records: list[dict[str, Any]] = []
@@ -343,6 +349,7 @@ class Orchestrator:
             region=region,
             ocr_enabled=self._config.ocr.enabled,
             screen_enabled=self._config.screen.enabled,
+            translate_partials=self._config.mt.translate_partials,
         )
         self._reset_session_state()
         self._ports_config = self._config
@@ -771,6 +778,7 @@ class Orchestrator:
                             language=self._settings.source_lang
                         )
                         segment_id = item.segment_id
+                        self._activate_segment(segment_id)
                         t_start_ms = item.t_start_ms
                         t_end_ms = item.t_start_ms + (
                             item.audio.size // VAD_FRAME_SAMPLES
@@ -801,6 +809,7 @@ class Orchestrator:
                         text = update.text.strip()
                         if not text:
                             logger.debug("empty final for segment %d", segment_id)
+                            self._deactivate_segment(segment_id)
                             continue
                         self._finalize_source(
                             segment_id=segment_id,
@@ -811,6 +820,7 @@ class Orchestrator:
                             audio_end_ts_ms=item.audio_end_ts_ms,
                             asr_ms=asr_ms,
                         )
+                        self._deactivate_segment(segment_id)
                 except (AsrUnavailable, AsrTimeout) as exc:
                     logger.warning("ASR unavailable: %s", exc)
                     self._notice(NoticeLevel.WARNING, "asr_unavailable", str(exc))
@@ -818,6 +828,8 @@ class Orchestrator:
                         with contextlib.suppress(Exception):
                             stream.close()
                     stream = None
+                    if segment_id:
+                        self._deactivate_segment(segment_id)
                 except Exception as exc:  # noqa: BLE001 - ASR failures keep the session alive
                     logger.warning("ASR failure: %s", exc, exc_info=True)
                     self._notice(NoticeLevel.ERROR, "asr_error", str(exc))
@@ -825,6 +837,8 @@ class Orchestrator:
                         with contextlib.suppress(Exception):
                             stream.close()
                     stream = None
+                    if segment_id:
+                        self._deactivate_segment(segment_id)
         finally:
             if stream is not None:
                 with contextlib.suppress(Exception):
@@ -858,6 +872,65 @@ class Orchestrator:
         self._submit_partial(event)
         return revision, text
 
+    def _queue_partial_translation(self, event: TranscriptSegmentEvent) -> None:
+        """Keep only the newest preview per segment for the MT worker."""
+
+        job = _TranslationJob(
+            segment_id=event.segment_id,
+            revision=event.revision,
+            text=event.text,
+            t_start_ms=event.t_start_ms,
+            t_end_ms=event.t_end_ms,
+            audio_end_ts_ms=0,
+            source_lang=event.source_lang,
+            target_lang=event.target_lang,
+            asr_latency_ms=0,
+            audio_end_to_text_ms=0,
+            partial=True,
+        )
+        with self._partial_job_lock:
+            if self._current_segment_id != event.segment_id:
+                return
+            self._partial_jobs[event.segment_id] = job
+
+    def _drop_partial_job(self, segment_id: int) -> None:
+        with self._partial_job_lock:
+            self._partial_jobs.pop(segment_id, None)
+
+    def _take_partial_job(self) -> _TranslationJob | None:
+        with self._partial_job_lock:
+            if not self._partial_jobs:
+                return None
+            _, job = self._partial_jobs.popitem()
+            return job
+
+    def _activate_segment(self, segment_id: int) -> None:
+        """Make ``segment_id`` current and discard any older segment's previews."""
+
+        with self._partial_lock:
+            for old_id in tuple(self._pending_partials):
+                if old_id != segment_id:
+                    self._pending_partials.pop(old_id, None)
+        with self._partial_job_lock:
+            for old_id in tuple(self._partial_jobs):
+                if old_id != segment_id:
+                    self._partial_jobs.pop(old_id, None)
+            self._current_segment_id = segment_id
+
+    def _deactivate_segment(self, segment_id: int) -> None:
+        """Drop previews from a segment that closed without a final translation."""
+
+        with self._partial_lock:
+            self._pending_partials.pop(segment_id, None)
+        with self._partial_job_lock:
+            self._partial_jobs.pop(segment_id, None)
+            if self._current_segment_id == segment_id:
+                self._current_segment_id = None
+
+    def _segment_is_current(self, segment_id: int) -> bool:
+        with self._partial_job_lock:
+            return self._current_segment_id == segment_id
+
     def _finalize_source(
         self,
         *,
@@ -870,6 +943,7 @@ class Orchestrator:
         asr_ms: int,
     ) -> None:
         self._drop_pending_partial(segment_id)
+        self._drop_partial_job(segment_id)
         revision += 1
         audio_end_to_text_ms = max(0, now_ms() - audio_end_ts_ms)
         event = TranscriptSegmentEvent(
@@ -955,20 +1029,32 @@ class Orchestrator:
         finally:
             with contextlib.suppress(Exception):
                 stream.close()
+            if segment_id:
+                self._deactivate_segment(segment_id)
 
     # -- MT ----------------------------------------------------------------
 
     def _mt_loop(self, ports: PipelinePorts) -> None:
         while True:
-            job = self._mt_queue.get()
+            try:
+                job = self._mt_queue.get(timeout=_MT_POLL_S)
+            except queue.Empty:
+                job = self._take_partial_job()
+                if job is None:
+                    continue
             if job is _SENTINEL:
                 break
             assert isinstance(job, _TranslationJob)
             if self._stop_event.is_set():
-                # Shutdown: do not start another model call. Resolve the
-                # segment as skipped so no client is left with a permanently
-                # pending translation, and drain the queue quickly.
-                self._emit_shutdown_skip(job)
+                # Shutdown: do not start another model call. Resolve queued
+                # finals as skipped so no client is left with a permanently
+                # pending translation, and drain the queue quickly. Previews
+                # are dropped: their source caption is already on screen.
+                if not job.partial:
+                    self._emit_shutdown_skip(job)
+                continue
+            if job.partial:
+                self._translate_partial(ports, job)
                 continue
             translation: str | None = None
             status = TranslationStatus.FAILED
@@ -1017,6 +1103,44 @@ class Orchestrator:
                     "persist_error",
                     f"failed to persist segment {event.segment_id}: {exc}",
                 )
+
+    def _translate_partial(self, ports: PipelinePorts, job: _TranslationJob) -> None:
+        """Translate one source preview; finals always take priority over these."""
+
+        if not self._segment_is_current(job.segment_id):
+            return
+        stopwatch = Stopwatch()
+        try:
+            [translation] = ports.translator.translate(
+                [job.text],
+                source_lang=job.source_lang,
+                target_lang=job.target_lang,
+            )
+        except Exception as exc:  # noqa: BLE001 - a preview must not disrupt the session
+            logger.debug(
+                "partial translation failed for segment %d: %s", job.segment_id, exc
+            )
+            return
+        if not translation:
+            return
+        event = TranscriptSegmentEvent(
+            session_id=self.session_id,
+            segment_id=job.segment_id,
+            revision=job.revision,
+            status=SegmentStatus.PARTIAL,
+            t_start_ms=job.t_start_ms,
+            t_end_ms=job.t_end_ms,
+            source_lang=job.source_lang,
+            target_lang=job.target_lang,
+            text=job.text,
+            translation=translation,
+            translation_status=TranslationStatus.OK,
+            mt_latency_ms=stopwatch.elapsed_ms(),
+        )
+        with self._partial_job_lock:
+            if self._current_segment_id != job.segment_id:
+                return
+            self._emit_transcript(event)
 
     def _emit_shutdown_skip(self, job: _TranslationJob) -> None:
         """Resolve a queued translation as skipped instead of starting inference."""
@@ -1105,13 +1229,24 @@ class Orchestrator:
                     self._pending_partials.values(), key=lambda item: item.segment_id
                 )
                 self._pending_partials.clear()
+            settings = self._settings
             for event in pending:
+                if not self._segment_is_current(event.segment_id):
+                    continue
                 self._emit_transcript(event)
+                if settings is not None and settings.translate_partials:
+                    self._queue_partial_translation(event)
 
     def _emit_transcript(self, event: TranscriptSegmentEvent) -> None:
         with self._revision_lock:
             previous = self._last_revision.get(event.segment_id, -1)
-            if event.revision <= previous:
+            if event.revision < previous:
+                return
+            if event.revision == previous and not (
+                event.status is SegmentStatus.PARTIAL and event.translation
+            ):
+                # A source preview arrives once per revision; only its
+                # translation may update the same revision in place.
                 return
             self._last_revision[event.segment_id] = event.revision
         self._publish(event)
@@ -1429,6 +1564,9 @@ class Orchestrator:
             self._last_revision.clear()
         with self._partial_lock:
             self._pending_partials.clear()
+        with self._partial_job_lock:
+            self._partial_jobs.clear()
+            self._current_segment_id = None
         with self._records_lock:
             self._final_records.clear()
             self._final_record_index.clear()

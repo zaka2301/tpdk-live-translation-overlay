@@ -145,6 +145,22 @@ class FakeAsrClient:
         pass
 
 
+class FirstFailsStream(FakeAsrStream):
+    def finish(self) -> AsrUpdate:
+        raise AsrUnavailable("simulated ASR failure")
+
+
+class FirstFailsClient(FakeAsrClient):
+    """Fail the first stream after a partial, then behave normally."""
+
+    def __init__(self) -> None:
+        self._opened = 0
+
+    def open(self, *, language: str | None = None) -> FakeAsrStream:
+        self._opened += 1
+        return FirstFailsStream() if self._opened == 1 else FakeAsrStream()
+
+
 class FakeTranslator:
     def translate(
         self,
@@ -169,6 +185,7 @@ def _config(tmp_path: Path) -> AppConfig:
             "screen": config.screen.model_copy(update={"enabled": False}),
             "ocr": config.ocr.model_copy(update={"enabled": False}),
             "summary": config.summary.model_copy(update={"enabled": False}),
+            "mt": config.mt.model_copy(update={"translate_partials": False}),
         }
     )
 
@@ -316,6 +333,129 @@ def test_session_pipeline_persists_artifacts(tmp_path: Path) -> None:
     assert metric_rows[0]["painted_ts_ms"] == str(translated["ts_ms"] + 150)
 
 
+def test_partial_source_preview_is_translated_in_place(tmp_path: Path) -> None:
+    script = [np.full(FRAME, 0.4, dtype=np.float32)] * 80 + [
+        np.zeros(FRAME, dtype=np.float32)
+    ] * 10
+    translator = FakeTranslator()
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource(script),
+            asr_client=FakeAsrClient(),
+            translator=translator,
+            segmenter_factory=FakeSegmenter,
+        )
+
+    config = _config(tmp_path)
+    config = config.model_copy(
+        update={"mt": config.mt.model_copy(update={"translate_partials": True})}
+    )
+    app = create_app(config, ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        translated, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "transcript.segment"
+            and message["status"] == "partial"
+            and message.get("translation_status") == "ok",
+            timeout=10.0,
+        )
+        assert translated["text"] == "hello wor"
+        assert translated["translation"] == "[id] hello wor"
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+        )
+
+
+def test_stale_preview_translation_is_not_painted_after_next_segment(
+    tmp_path: Path,
+) -> None:
+    loud = np.full(FRAME, 0.4, dtype=np.float32)
+    quiet = np.zeros(FRAME, dtype=np.float32)
+    script = [loud] * 160 + [quiet] * 8 + [loud] * 80 + [quiet] * 10
+    translator = BlockingTranslator()
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource(script),
+            asr_client=FirstFailsClient(),
+            translator=translator,
+            segmenter_factory=FakeSegmenter,
+        )
+
+    config = _config(tmp_path)
+    config = config.model_copy(
+        update={"mt": config.mt.model_copy(update={"translate_partials": True})}
+    )
+    app = create_app(config, ports_factory=factory)
+
+    seen: list[dict[str, Any]] = []
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        assert translator.started.wait(10.0), "the preview translation never started"
+
+        second_partial = None
+        failed = False
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            message = _recv(ws)
+            seen.append(message)
+            if message["type"] == "notice" and message["code"] == "asr_unavailable":
+                failed = True
+            if (
+                message["type"] == "transcript.segment"
+                and message["status"] == "partial"
+                and message["segment_id"] != 1
+            ):
+                second_partial = message
+                break
+        assert failed, "the first ASR stream did not fail"
+        assert second_partial is not None, "the second segment never started"
+
+        translator.release.set()
+        final, after = _wait_for(
+            ws,
+            lambda message: message["type"] == "transcript.segment"
+            and message["status"] == "final"
+            and message.get("translation_status") == "ok"
+            and message["segment_id"] == second_partial["segment_id"],
+            timeout=10.0,
+        )
+        seen.extend(after)
+        stale = [
+            message
+            for message in seen
+            if message["type"] == "transcript.segment"
+            and message.get("translation_status") == "ok"
+            and message["segment_id"] == 1
+        ]
+        assert stale == [], "the old preview translation repainted segment 1"
+        assert final["segment_id"] == second_partial["segment_id"]
+        assert translator.calls >= 2
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+        )
+
+
 def test_asr_failure_keeps_session_running(tmp_path: Path) -> None:
     app = create_app(
         _config(tmp_path),
@@ -370,6 +510,30 @@ class SlowTranslator(FakeTranslator):
         self.calls += 1
         if self.calls == 1:
             time.sleep(self.delay_s)
+        return super().translate(
+            texts, source_lang=source_lang, target_lang=target_lang
+        )
+
+
+class BlockingTranslator(FakeTranslator):
+    """Hold the first translation until the test releases it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def translate(
+        self,
+        texts: list[str],
+        *,
+        source_lang: str,
+        target_lang: str,
+    ) -> list[str]:
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            assert self.release.wait(10.0)
         return super().translate(
             texts, source_lang=source_lang, target_lang=target_lang
         )

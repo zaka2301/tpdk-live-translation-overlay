@@ -226,6 +226,36 @@ def test_caption_language_menu_matches_provider(qt_app: QApplication) -> None:
     assert {"pt", "el", "tr", "yue"}.isdisjoint(codes)
 
 
+def test_caption_enriches_partial_with_same_revision_translation(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(revision=4, status=SegmentStatus.PARTIAL, text="the deriv")
+        )
+        assert window.current_text() == ("the deriv", "")
+        window.show_segment(
+            _segment(
+                revision=4,
+                status=SegmentStatus.PARTIAL,
+                text="the deriv",
+                translation="turunan itu",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        assert window.current_text() == ("the deriv", "turunan itu")
+        # A late source-only copy at the same revision must not wipe it.
+        window.show_segment(
+            _segment(revision=4, status=SegmentStatus.PARTIAL, text="the deriv")
+        )
+        assert window.current_text() == ("the deriv", "turunan itu")
+    finally:
+        window.close()
+
+
 def test_caption_ignores_stale_revisions(qt_app: QApplication) -> None:
     window = CaptionWindow(
         UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
