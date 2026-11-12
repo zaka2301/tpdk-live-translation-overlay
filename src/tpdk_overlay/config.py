@@ -73,18 +73,19 @@ class AudioConfig(_Section):
     vad: VadConfig = VadConfig()
 
 
-class NativeAsrConfig(_Section):
-    """Windows-native transformers backend (backup when WSL/vLLM is unavailable)."""
+class LlamaCppAsrConfig(_Section):
+    """Qwen3-ASR GGUF served by a separate local ``llama serve`` process."""
 
-    model: str = "Qwen/Qwen3-ASR-0.6B"
-    device: Literal["auto", "cuda", "cpu"] = "auto"
-    dtype: Literal["float16", "bfloat16", "float32"] = "float16"
-    max_inference_batch_size: int = Field(default=1, ge=-1)
-    max_new_tokens: int = Field(default=256, gt=0)
+    base_url: str = "http://127.0.0.1:8081"
+    max_new_tokens: int = Field(default=128, gt=0)
+    partial_interval_ms: int = Field(default=5000, gt=0)
+    partial_tail_sec: float = Field(default=4.0, gt=0)
+    min_energy_dbfs: float = -40.0
+    system_prompt: str = ""
 
 
 class AsrConfig(_Section):
-    backend: Literal["http", "native"] = "http"
+    backend: Literal["http", "llama_cpp"] = "llama_cpp"
     base_url: str = "http://127.0.0.1:8000"
     model: str = "Qwen/Qwen3-ASR-0.6B"
     language: str | None = None
@@ -92,7 +93,7 @@ class AsrConfig(_Section):
     unfixed_chunk_num: int = Field(default=4, ge=0)
     unfixed_token_num: int = Field(default=5, ge=0)
     timeout_s: float = Field(default=30.0, gt=0)
-    native: NativeAsrConfig = NativeAsrConfig()
+    llama_cpp: LlamaCppAsrConfig = LlamaCppAsrConfig()
 
 
 class MtConfig(_Section):
@@ -258,8 +259,8 @@ __all__ = [
     "CaptionConfig",
     "ENV_PREFIX",
     "LanguageConfig",
+    "LlamaCppAsrConfig",
     "MtConfig",
-    "NativeAsrConfig",
     "OcrConfig",
     "OcrOverlayConfig",
     "ScreenConfig",

@@ -27,20 +27,25 @@ audio:
     pre_roll_ms: 300
 
 asr:
-  backend: http                # http = vLLM service in WSL; native = transformers on Windows (backup)
-  base_url: http://127.0.0.1:8000
-  model: Qwen/Qwen3-ASR-0.6B   # informational; the service decides which weights are loaded
-  language: null               # null = auto-detect; "English"/"Indonesian" sent to /api/start?language=
+  backend: llama_cpp           # llama_cpp = local llama serve (default here); http = vLLM in WSL
+  base_url: http://127.0.0.1:8000  # http backend only; llama_cpp uses asr.llama_cpp.base_url
+  model: Qwen/Qwen3-ASR-0.6B   # informational; the service (or llama serve) decides which weights are loaded
+  language: null               # null = auto-detect; sent to the HTTP service; ignored by llama_cpp (always auto-detects)
   chunk_size_sec: 1.0          # vLLM streaming chunk; lower = faster partials, weaker accuracy
   unfixed_chunk_num: 4
   unfixed_token_num: 5
   timeout_s: 30
-  native:                      # used only when backend: native
-    model: Qwen/Qwen3-ASR-0.6B
-    device: auto               # auto | cuda | cpu
-    dtype: float16             # float16 | bfloat16 | float32 (float32 on CPU)
-    max_inference_batch_size: 1
-    max_new_tokens: 256
+  llama_cpp:                   # used only when backend: llama_cpp
+    # Separate llama serve process; start it before the backend (model + mmproj
+    # auto-download on first run). scripts/serve_asr_llama.ps1 wraps this:
+    #   llama serve -hf ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0 --host 127.0.0.1 --port 8081 `
+    #     -ngl all -c 4096 -np 1 -n 128 --cache-type-k q8_0 --cache-type-v q8_0
+    base_url: http://127.0.0.1:8081
+    max_new_tokens: 128        # hard cap per request; partial previews use min(64, this)
+    partial_interval_ms: 5000  # preview cadence over the last partial_tail_sec of audio
+    partial_tail_sec: 4.0      # partial prompt window; kept short to bound latency
+    min_energy_dbfs: -40.0     # windows quieter than this never reach the server
+    system_prompt: ""          # experimental; empty = no system message
 
 mt:
   model: facebook/nllb-200-distilled-600M

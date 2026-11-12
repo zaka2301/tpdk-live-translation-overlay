@@ -1,19 +1,13 @@
-r"""Reproducible latency/resource benchmark for the two real ASR backends.
+r"""Reproducible latency/resource benchmark for the HTTP ASR service.
 
-Measures the shipping adapters (``create_asr_client``) end to end: model load,
-stream open, per-chunk push, post-utterance finish, and pipeline latency, plus
-GPU/process resources sampled in the background.
+Measures the shipping HTTP adapter (``create_asr_client``) end to end: model
+load, stream open, per-chunk push, post-utterance finish, and pipeline latency,
+plus GPU/process resources sampled in the background.
 
 Examples::
 
-    python scripts/bench_asr.py --backend http --mode realtime --reps 5
-    python scripts/bench_asr.py --backend native --mode burst --reps 3
-    python scripts/bench_asr.py --backend http --vram-source wsl \
-        --wsl-pgrep asr_service.py
-
-Native measurement notes: the transformers backend buffers audio and only
-transcribes on ``finish``, so ``first_partial_ms`` is null and ``finish_ms``
-carries the full decode cost.
+    python scripts/bench_asr.py --mode realtime --reps 5
+    python scripts/bench_asr.py --vram-source wsl --wsl-pgrep asr_service.py
 
 Realtime pacing: chunk ``k`` is pushed once it is complete, i.e. at
 ``t0 + (k+1)*chunk_size_sec`` (a shorter tail chunk at ``t0 + audio_duration``),
@@ -323,23 +317,10 @@ class ResourceSampler:
         *,
         vram_source: str,
         wsl_distro: str,
-        use_torch: bool = False,
     ) -> None:
         self.interval_s = max(interval_s, 1.0) if vram_source == "wsl" else interval_s
         self.vram_source = vram_source
         self.wsl_distro = wsl_distro
-        # Spawning nvidia-smi every sample distorts in-process inference (the
-        # subprocess contends with the GPU/CPU doing the decode), so in-process
-        # native runs read VRAM straight from CUDA and leave GPU util unset.
-        self._torch: Any | None = None
-        if use_torch:
-            try:
-                import torch
-
-                if torch.cuda.is_available():
-                    self._torch = torch
-            except Exception:
-                self._torch = None
         self.process = psutil.Process()
         self.windows: list[list[dict[str, Any]]] = []
         self._active: list[dict[str, Any]] | None = None
@@ -376,27 +357,19 @@ class ResourceSampler:
     def _sample(self) -> dict[str, Any]:
         vram_mib: float | None = None
         gpu_util: float | None = None
-        if self._torch is not None:
-            try:
-                free, total = self._torch.cuda.mem_get_info()
-            except Exception:
-                self._torch = None
-            else:
-                vram_mib = (total - free) / MIB
-        if self._torch is None:
-            rows = _run_nvidia_smi(
-                "memory.used,utilization.gpu",
-                vram_source=self.vram_source,
-                wsl_distro=self.wsl_distro,
-            )
-            if rows:
-                parts = [part.strip() for part in rows[0].split(",")]
-                if len(parts) >= 2:
-                    vram_mib = _to_float(parts[0])
-                    gpu_util = _to_float(parts[1])
-            elif not self._gpu_warned:
-                self._gpu_warned = True
-                print("warning: GPU metrics unavailable; fields will be null", file=sys.stderr)
+        rows = _run_nvidia_smi(
+            "memory.used,utilization.gpu",
+            vram_source=self.vram_source,
+            wsl_distro=self.wsl_distro,
+        )
+        if rows:
+            parts = [part.strip() for part in rows[0].split(",")]
+            if len(parts) >= 2:
+                vram_mib = _to_float(parts[0])
+                gpu_util = _to_float(parts[1])
+        elif not self._gpu_warned:
+            self._gpu_warned = True
+            print("warning: GPU metrics unavailable; fields will be null", file=sys.stderr)
         times = self.process.cpu_times()
         return {
             "ts": time.perf_counter(),
@@ -503,7 +476,6 @@ def _environment(vram_source: str, wsl_distro: str) -> dict[str, Any]:
         "gpu": rows[0] if rows else None,
         "torch": _dist_version("torch"),
         "transformers": _dist_version("transformers"),
-        "qwen_asr": _dist_version("qwen-asr"),
     }
 
 
@@ -512,9 +484,8 @@ def _environment(vram_source: str, wsl_distro: str) -> dict[str, Any]:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Benchmark the shipping ASR adapters (native transformers or HTTP service).",
+        description="Benchmark the HTTP ASR adapter (services/asr_service.py in WSL2).",
     )
-    parser.add_argument("--backend", choices=("native", "http"), default="http")
     parser.add_argument("--clips-dir", type=Path, default=DEFAULT_CLIPS_DIR)
     parser.add_argument(
         "--language",
@@ -585,12 +556,6 @@ def _print_resources(
         f"- CPU avg: process {_fmt(during['proc_cpu_avg_pct'])} %, "
         f"system {_fmt(during['system_cpu_avg_pct'])} %"
     )
-    torch_alloc = during.get("torch_peak_alloc_mib")
-    if torch_alloc is not None:
-        print(
-            f"- torch peak alloc/reserved: {_fmt(torch_alloc)} / "
-            f"{_fmt(during.get('torch_peak_reserved_mib'))} MiB"
-        )
     if wsl:
         elapsed = wsl_elapsed_s or 0.0
         print(
@@ -618,21 +583,18 @@ def _run(args: argparse.Namespace) -> int:
     clips = _discover_clips(args.clips_dir)
     asr_config = load_config().asr.model_copy(
         update={
-            "backend": args.backend,
+            "backend": "http",
             "base_url": args.base_url,
             "language": language,
             "chunk_size_sec": args.chunk_size_sec,
         },
     )
     client = create_asr_client(asr_config)
-    use_torch = args.backend == "native"
     sampler = ResourceSampler(
         args.gpu_sample_ms / 1000.0,
         vram_source=args.vram_source,
         wsl_distro=args.wsl_distro,
-        use_torch=use_torch,
     )
-    sampler_source = "torch" if use_torch else args.vram_source
 
     baseline = sampler.snapshot()
     load_start = time.perf_counter()
@@ -640,24 +602,9 @@ def _run(args: argparse.Namespace) -> int:
     model_load_ms = (time.perf_counter() - load_start) * 1000.0
     idle = sampler.snapshot()
 
-    torch_peaks: dict[str, float | None] = {
-        "torch_peak_alloc_mib": None,
-        "torch_peak_reserved_mib": None,
-    }
-    if args.backend == "native" and "torch" in sys.modules:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-                torch_peaks["torch_peak_alloc_mib"] = 0.0
-                torch_peaks["torch_peak_reserved_mib"] = 0.0
-        except Exception as exc:  # pragma: no cover - depends on the local driver
-            print(f"warning: torch CUDA peak stats unavailable ({exc})", file=sys.stderr)
-
     wsl_start: dict[str, Any] | None = None
     wsl_end: dict[str, Any] | None = None
-    if args.backend == "http" and args.wsl_pgrep:
+    if args.wsl_pgrep:
         wsl_start = _wsl_service_snapshot(distro=args.wsl_distro, pattern=args.wsl_pgrep)
 
     chunk_samples = max(1, int(round(args.chunk_size_sec * SAMPLE_RATE_16K)))
@@ -699,23 +646,10 @@ def _run(args: argparse.Namespace) -> int:
 
     client.close()
 
-    if args.backend == "http" and args.wsl_pgrep:
+    if args.wsl_pgrep:
         wsl_end = _wsl_service_snapshot(distro=args.wsl_distro, pattern=args.wsl_pgrep)
 
-    if torch_peaks["torch_peak_alloc_mib"] is not None:
-        try:
-            import torch
-
-            torch.cuda.synchronize()
-            torch_peaks["torch_peak_alloc_mib"] = torch.cuda.max_memory_allocated() / MIB
-            torch_peaks["torch_peak_reserved_mib"] = torch.cuda.max_memory_reserved() / MIB
-        except Exception as exc:  # pragma: no cover - depends on the local driver
-            print(f"warning: torch CUDA peak stats unavailable ({exc})", file=sys.stderr)
-            torch_peaks["torch_peak_alloc_mib"] = None
-            torch_peaks["torch_peak_reserved_mib"] = None
-
     during = sampler.aggregate()
-    during.update({key: _round_opt(value) for key, value in torch_peaks.items()})
 
     wsl_summary: dict[str, Any] | None = None
     wsl_elapsed_s: float | None = None
@@ -732,12 +666,12 @@ def _run(args: argparse.Namespace) -> int:
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output = args.output or (
-        PROJECT_ROOT / "data" / "benchmarks" / f"asr_bench_{args.backend}_{stamp}.json"
+        PROJECT_ROOT / "data" / "benchmarks" / f"asr_bench_http_{stamp}.json"
     )
 
     payload = {
         "schema": "tpdk-asr-bench-v1",
-        "backend": args.backend,
+        "backend": "http",
         "created_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "environment": _environment(args.vram_source, args.wsl_distro),
         "settings": {
@@ -749,7 +683,7 @@ def _run(args: argparse.Namespace) -> int:
             "chunk_size_sec": args.chunk_size_sec,
             "base_url": args.base_url,
             "gpu_sample_ms": args.gpu_sample_ms,
-            "vram_source": sampler_source,
+            "vram_source": args.vram_source,
             "wsl_distro": args.wsl_distro,
             "wsl_pgrep": args.wsl_pgrep,
         },
@@ -774,7 +708,7 @@ def _run(args: argparse.Namespace) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
-    print(f"backend: {args.backend}  mode: {args.mode}  language: {language}  ")
+    print(f"backend: http  mode: {args.mode}  language: {language}  ")
     print(f"warmup: {args.warmups}  reps: {args.reps}  chunk: {args.chunk_size_sec}s  ")
     print(f"model_load_ms: {model_load_ms:.1f}")
     print(f"baseline: {baseline}")
@@ -782,7 +716,7 @@ def _run(args: argparse.Namespace) -> int:
     _print_table(clip_entries)
     _print_resources(
         during,
-        vram_source=sampler_source,
+        vram_source=args.vram_source,
         wsl=wsl_summary,
         wsl_elapsed_s=wsl_elapsed_s,
     )

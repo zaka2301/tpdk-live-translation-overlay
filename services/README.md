@@ -81,8 +81,9 @@ profile is what fits. `0.60` with a 256-token batch crashed the engine on the
 first chunk (`CUDA error: device not ready`); `0.60/512` was stable but the long
 clip's finish latency rose to ~426 ms (vs ~92 ms at `0.68`), so `0.68` is the
 default. NLLB-200-distilled-600M in fp16 takes roughly 1.2 GB on the Windows
-side, so even this profile leaves too little for ASR + NLLB; use the native
-backend (or a quantized/smaller model) when both must coexist. OCR stays on CPU.
+side, so even this profile leaves too little for ASR + NLLB; use the Windows
+`llama_cpp` backend (or a quantized/smaller HTTP model) when both must coexist.
+OCR stays on CPU.
 The WSL VM is capped at 8 GB (`.wslconfig`); keep `swap_space=0`. The default
 4 GiB CPU swap plus the ~4.5 GB engine RSS left no headroom and likely
 contributed to the host OOM during testing. `swap_space=0` is safe here because
@@ -96,14 +97,3 @@ curl -s http://127.0.0.1:8000/            # {"service":"tpdk-asr",...}
 nvidia-smi                                 # ~3.3 GB at 0.68
 ```
 
-## Native Windows fallback (no WSL)
-
-When WSL2/vLLM is unavailable, set `asr.backend: native` (or
-`TPDK__ASR__BACKEND=native`). The Windows backend then loads
-`qwen-asr` with its transformers engine in-process
-(`src/tpdk_overlay/asr/transformers_backend.py`); no HTTP service is used.
-
-Trade-offs: the transformers engine has no streaming decode, so each VAD
-utterance is buffered and transcribed once at `finish` (final-only, no partial
-captions), and the model competes with NLLB for the same 4 GB of VRAM. Use it as
-a backup for demos without WSL, not as the latency-critical default.

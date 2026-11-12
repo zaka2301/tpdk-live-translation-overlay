@@ -4,6 +4,7 @@ import httpx
 import numpy as np
 import pytest
 
+from tpdk_overlay.asr import create_asr_client
 from tpdk_overlay.asr.errors import AsrTimeout, AsrUnavailable
 from tpdk_overlay.asr.http_backend import HttpAsrClient
 from tpdk_overlay.config import AsrConfig
@@ -107,4 +108,10 @@ def test_warmup_accepts_upstream_demo_html() -> None:
 
     client = _client(handler)
     client.warmup()
+    client.close()
+
+
+def test_factory_selects_http() -> None:
+    client = create_asr_client(AsrConfig(backend="http"))
+    assert isinstance(client, HttpAsrClient)
     client.close()

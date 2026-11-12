@@ -15,8 +15,8 @@ $py = Join-Path $root ".venv\Scripts\python.exe"
 Write-Host "Installing CUDA 13.0 torch (must be installed before the ml extra)..."
 & uv pip install --python $py "torch==2.14.1" --index-url https://download.pytorch.org/whl/cu130
 
-Write-Host "Installing project extras (ui, ml, asr-native, ocr, summarize, dev)..."
-& uv pip install --python $py -e ".[ui,ml,asr-native,ocr,summarize,dev]"
+Write-Host "Installing project extras (ui, ml, ocr, summarize, dev)..."
+& uv pip install --python $py -e ".[ui,ml,ocr,summarize,dev]"
 
 Write-Host "Checking environment..."
 & $py "scripts\check_env.py"

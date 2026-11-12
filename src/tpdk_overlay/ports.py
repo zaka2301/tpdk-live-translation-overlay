@@ -7,7 +7,9 @@ the real adapter. Keep the interfaces small: behavior belongs behind the seam.
 Invariants every adapter must honor
 -----------------------------------
 * ``AsrStream.push`` accepts 16 kHz mono ``float32`` in ``[-1, 1]`` and returns
-  the **cumulative** text for that stream. ``finish`` flushes and is idempotent.
+  the current best text for that stream. HTTP partials are cumulative;
+  ``llama_cpp`` partials may cover only the recent tail. ``finish`` flushes and
+  is authoritative; callers replace the displayed text, never append.
 * ``Translator.translate`` preserves input order and returns one output per
   input, even when it batches internally.
 * ``OcrEngine.recognize`` returns reading order, boxes in the coordinate space of
@@ -71,7 +73,12 @@ class FinalSummaryRequest:
 
 class AsrStream(Protocol):
     def push(self, pcm16k: FloatArray) -> AsrUpdate:
-        """Feed the next chunk; return the cumulative transcript so far."""
+        """Feed the next chunk; return the current transcript preview.
+
+        Partials may be cumulative (HTTP streaming) or a recent-tail preview
+        (llama.cpp); the caller replaces the displayed text rather than
+        appending.
+        """
         ...
 
     def finish(self) -> AsrUpdate:

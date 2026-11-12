@@ -13,9 +13,12 @@ def test_default_config_loads() -> None:
     config = load_config()
     assert config.server.port == 8765
     assert config.asr.model == "Qwen/Qwen3-ASR-0.6B"
-    assert config.asr.backend == "http"
-    assert config.asr.native.model == "Qwen/Qwen3-ASR-0.6B"
-    assert config.asr.native.device == "auto"
+    assert config.asr.backend == "llama_cpp"
+    assert config.asr.llama_cpp.base_url == "http://127.0.0.1:8081"
+    assert config.asr.llama_cpp.max_new_tokens == 128
+    assert config.asr.llama_cpp.partial_interval_ms == 5000
+    assert config.asr.llama_cpp.partial_tail_sec == 4.0
+    assert config.asr.llama_cpp.min_energy_dbfs == -40.0
     assert config.ocr.det_model == "PP-OCRv6_small_det"
     assert config.data_dir == project_root() / "data"
 

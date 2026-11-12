@@ -46,7 +46,6 @@ OPTIONAL_MODULES = {
     "paddle": "PP-OCRv6 runtime",
     "paddleocr": "slide OCR",
     "PySide6": "overlay UI",
-    "qwen_asr": "native ASR backup",
     "google.genai": "Gemini summaries",
 }
 
@@ -161,14 +160,26 @@ def _check_port(host: str, port: int) -> None:
         warnings.append("backend-port")
 
 
-def _check_native_asr() -> None:
+def _check_llama_asr(base_url: str) -> None:
     try:
-        import qwen_asr  # noqa: F401
+        import httpx
+
+        response = httpx.get(base_url.rstrip("/") + "/health", timeout=2.0)
+        response.raise_for_status()
+        payload = response.json()
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status in (None, "ok"):
+            _line("OK", f"llama.cpp ASR server ready at {base_url}")
+            return
+        warnings.append("llama-asr-not-ready")
+        _line("WARN", f"llama.cpp ASR server at {base_url} not ready: {payload}")
     except Exception as exc:  # noqa: BLE001
-        failures.append("qwen_asr")
-        _line("FAIL", f"native ASR backend needs qwen-asr: {exc}")
-        return
-    _line("OK", "native ASR backend ready (weights load on warmup)")
+        warnings.append("llama-asr")
+        _line(
+            "WARN",
+            f"llama.cpp ASR server not reachable at {base_url}: {exc} "
+            "(start scripts/serve_asr_llama.ps1)",
+        )
 
 
 def _check_asr(base_url: str) -> None:
@@ -199,8 +210,11 @@ def main() -> int:
         _check_port(config.server.host, config.server.port)
         if config.asr.backend == "http":
             _check_asr(config.asr.base_url)
+        elif config.asr.backend == "llama_cpp":
+            _check_llama_asr(config.asr.llama_cpp.base_url)
         else:
-            _check_native_asr()
+            warnings.append("asr-backend")
+            _line("WARN", f"unknown asr.backend {config.asr.backend!r}; check configs/default.yaml")
 
     if failures:
         print(f"\n{len(failures)} core check(s) failed: {', '.join(failures)}")
