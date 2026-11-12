@@ -25,12 +25,21 @@ inside WSL).
 
 ```bash
 bash scripts/serve_asr_wsl.sh
+# single-client defaults (RTX 3050 4 GB):
+#   GPU_MEM_UTIL=0.68 MAX_MODEL_LEN=1024 MAX_NUM_BATCHED_TOKENS=512
+#   MAX_NUM_SEQS=1
 # overrides: ASR_MODEL=Qwen/Qwen3-ASR-1.7B GPU_MEM_UTIL=0.55 PORT=8000 \
 #            bash scripts/serve_asr_wsl.sh
 ```
 
 The script runs `services/asr_service.py` and binds `127.0.0.1:8000`. Windows
 reaches it at `http://127.0.0.1:8000` (WSL localhost forwarding).
+`MAX_NUM_SEQS=1` is deliberate: this service is a single real-time stream, not a
+batch server. `ENFORCE_EAGER=1` trades CUDA-graph memory for decode speed if you
+need a lower `GPU_MEM_UTIL`.
+`SWAP_SPACE=0` is deliberate: vLLM's default 4 GiB CPU KV swap does not fit the
+8 GB WSL VM alongside the engine. There is no startup inference warmup; the
+first utterance after a fresh start can be slower.
 
 ## HTTP contract used by the backend
 
@@ -62,16 +71,29 @@ upstream demo, ASR auto-detects and only MT uses the selected source language.
 
 ## GPU budget (RTX 3050 Laptop, 4 GB)
 
-vLLM preallocates `gpu_memory_utilization × VRAM`, so the default is `0.45`
-(~1.8 GB). NLLB-200-distilled-600M in fp16 takes roughly 1.2 GB on the Windows
-side, and OCR stays on CPU. Raise the ASR share only after re-measuring NFR-05
-(total local model VRAM ≤ 4 GB).
+vLLM preallocates `gpu_memory_utilization × VRAM`; it is not demand-paged. The
+single-client profile is `GPU_MEM_UTIL=0.68`, `MAX_MODEL_LEN=1024`,
+`MAX_NUM_BATCHED_TOKENS=512`, `MAX_NUM_SEQS=1`, which measured ~3.3 GB VRAM
+in the production benchmark (a warmup transient touched ~3.56 GB). The old
+`0.45` default cannot boot with vLLM's
+default `max_num_batched_tokens=8192` / `max_model_len=65536`; the reduced
+profile is what fits. `0.60` with a 256-token batch crashed the engine on the
+first chunk (`CUDA error: device not ready`); `0.60/512` was stable but the long
+clip's finish latency rose to ~426 ms (vs ~92 ms at `0.68`), so `0.68` is the
+default. NLLB-200-distilled-600M in fp16 takes roughly 1.2 GB on the Windows
+side, so even this profile leaves too little for ASR + NLLB; use the native
+backend (or a quantized/smaller model) when both must coexist. OCR stays on CPU.
+The WSL VM is capped at 8 GB (`.wslconfig`); keep `swap_space=0`. The default
+4 GiB CPU swap plus the ~4.5 GB engine RSS left no headroom and likely
+contributed to the host OOM during testing. `swap_space=0` is safe here because
+`MAX_NUM_SEQS=1` means there is no preemption to swap.
+Raise the ASR share only after re-measuring NFR-05 (total local model VRAM ≤ 4 GB).
 
 ## Verify
 
 ```bash
 curl -s http://127.0.0.1:8000/            # {"service":"tpdk-asr",...}
-nvidia-smi                                 # python process holds ~1.8 GB
+nvidia-smi                                 # ~3.3 GB at 0.68
 ```
 
 ## Native Windows fallback (no WSL)

@@ -141,8 +141,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.45)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.68)
+    parser.add_argument("--swap-space", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-model-len", type=int, default=1024)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=512)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--unfixed-chunk-num", type=int, default=4)
     parser.add_argument("--unfixed-token-num", type=int, default=5)
     parser.add_argument("--chunk-size-sec", type=float, default=1.0)
@@ -159,11 +164,19 @@ def main() -> None:
         "unfixed_token_num": args.unfixed_token_num,
         "chunk_size_sec": args.chunk_size_sec,
     }
-    _asr = Qwen3ASRModel.LLM(
-        model=args.asr_model_path,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_new_tokens=args.max_new_tokens,
-    )
+    engine_kwargs: dict[str, object] = {
+        "model": args.asr_model_path,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "swap_space": args.swap_space,
+        "max_new_tokens": args.max_new_tokens,
+        "max_model_len": args.max_model_len,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": args.max_num_seqs,
+    }
+    if args.enforce_eager:
+        engine_kwargs["enforce_eager"] = True
+    print(f"engine kwargs: {engine_kwargs}", flush=True)
+    _asr = Qwen3ASRModel.LLM(**engine_kwargs)  # type: ignore[arg-type]
     print(f"Model loaded: {args.asr_model_path}", flush=True)
     app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
 

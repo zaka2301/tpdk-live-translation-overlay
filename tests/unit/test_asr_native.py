@@ -93,6 +93,22 @@ def test_native_empty_stream_skips_model_load(fake_qwen) -> None:
     assert fake_qwen.load_calls == 0
 
 
+def test_native_warmup_runs_inference_and_is_idempotent(fake_qwen) -> None:
+    client = TransformersAsrClient(_config(device="cpu"))
+    client.warmup()
+
+    assert fake_qwen.load_calls == 1
+    assert fake_qwen.instance is not None
+    calls = fake_qwen.instance.calls
+    assert calls
+    assert all(sample_rate == 16_000 for _, sample_rate, _ in calls)
+
+    count = len(calls)
+    client.warmup()
+    assert fake_qwen.load_calls == 1
+    assert len(fake_qwen.instance.calls) == count
+
+
 def test_factory_selects_native(fake_qwen) -> None:
     client = create_asr_client(_config(device="cpu"))
     assert isinstance(client, TransformersAsrClient)
