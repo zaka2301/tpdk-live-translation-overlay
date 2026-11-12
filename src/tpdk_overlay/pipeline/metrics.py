@@ -1,9 +1,12 @@
 """Latency rows for ``metrics.csv`` (NFR-01/NFR-03, phase 7).
 
-Every final transcript segment and OCR frame is noted when it is emitted; when
-the UI returns a ``render.ack`` for that event, the painted timestamp is joined
-back in and one row is appended. Partial revisions are not measured: only the
-authoritative final and each OCR frame carry the latency anchors.
+Every resolved final transcript segment and OCR frame is noted when it is
+emitted; when the UI returns a ``render.ack`` for that event, the painted
+timestamp is joined back in and one row is appended. A source-only final
+(``translation_status == pending``) is skipped: the orchestrator emits it just
+before MT so the caption can appear early, and the resolved final that follows
+is the user-facing paint that NFR-01 measures. That keeps one row per segment
+instead of two. Partial revisions are not measured either.
 
 The CSV columns match AGENT.md section 9; ``eval_latency.py`` computes
 ``painted_ts_ms - audio_end_ts_ms`` (or ``change_ts_ms``) for the p95.
@@ -18,7 +21,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from tpdk_overlay.contracts import OcrFrameEvent, SegmentStatus, TranscriptSegmentEvent
+from tpdk_overlay.contracts import (
+    OcrFrameEvent,
+    SegmentStatus,
+    TranscriptSegmentEvent,
+    TranslationStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,9 @@ class MetricsRecorder:
 
         if isinstance(event, TranscriptSegmentEvent):
             if event.status is not SegmentStatus.FINAL:
+                return
+            if event.translation_status is TranslationStatus.PENDING:
+                # Source preview paint; the resolved final carries the row.
                 return
             row: dict[str, Any] = {
                 "kind": "transcript",

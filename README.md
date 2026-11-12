@@ -16,7 +16,22 @@ See [ASR backends](#asr-backends). Translation defaults to `nllb_ct2`
 (CTranslate2 int8 on CPU, zero VRAM); see
 [Translation](#translation-nllb-200).
 
-Implementation status and the build order live in [AGENT.md](AGENT.md).
+Implementation status and the build order live in [AGENTS.md](AGENTS.md).
+
+## One command
+
+`main.py` starts and supervises the three local processes:
+
+```powershell
+python main.py
+```
+
+If `python` is not the project venv, the launcher restarts itself with
+`.venv\Scripts\python.exe`. It waits for the ASR server and backend health
+endpoints before opening the overlay, reuses services that are already running,
+and stops the ones it started when the overlay exits (tray **Quit** or Ctrl+C).
+`--no-asr`, `--no-backend`, and `--model <llama -hf spec>` are available for
+partial stacks and alternate checkpoints.
 
 ## Processes
 
@@ -25,9 +40,49 @@ Implementation status and the build order live in [AGENT.md](AGENT.md).
 | ASR server (Qwen3-ASR GGUF + llama.cpp) | Windows, `127.0.0.1:8081` | `powershell -File scripts\serve_asr_llama.ps1` |
 | ASR service (Qwen3-ASR + vLLM, optional) | WSL2 Ubuntu, `127.0.0.1:8000` | `bash scripts/serve_asr_wsl.sh` |
 | Backend (capture, MT, OCR, summaries) | Windows | `.\.venv\Scripts\python.exe -m tpdk_overlay.server.app` |
-| Overlay UI (PySide6) | Windows | not built yet — AGENT.md phase 4 |
+| Overlay UI (PySide6) | Windows | `powershell -File scripts\run_overlay.ps1` |
+| All of the above | One console | `python main.py` |
 
 The backend listens on `127.0.0.1:8765`: `GET /api/health` and WebSocket `/ws`.
+
+## Caption overlay
+
+`python main.py` starts the ASR server, backend, and overlay together. To run the
+pieces manually instead, start the backend first and the overlay in a second
+terminal:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_overlay.ps1
+```
+
+The caption window is frameless, translucent, and always on top. It starts in
+click-through mode, so clicks go to the lecture app beneath it. `Ctrl+Alt+L` or
+the tray menu toggles interactive mode, which reveals the control bar and
+enables dragging the window or resizing it from the bottom-right grip. If the
+hotkey is already registered by another app, the tray menu is the fallback; when
+neither the tray nor the hotkey is available, the overlay starts interactive so
+it cannot lock itself out.
+
+- **Start / Stop** sends `session.start` / `session.stop`; Pause and Resume are
+  in the tray menu.
+- **From / To** and the **Summary** interval send `settings.update` while a
+  session is active (they set the values for the next session otherwise).
+- **Region** opens a full-desktop rubber-band picker and sends `region.update`
+  in physical pixels (monitor index plus left/top/width/height), which is what
+  the mss capture adapter consumes.
+- **History** lists final source/translation pairs in a scrollable window;
+  **Export...** writes them to a markdown file.
+
+Source text stays small and the translation is large. Partials replace the
+current segment, finals accumulate in history, and the UI acknowledges every
+painted final with `render.ack` so NFR-01/NFR-03 latency rows can be computed.
+The backend starts capture without waiting for NLLB: source captions appear about two seconds after speech starts (the llama.cpp
+preview cadence), the translation model finishes loading in the
+background (the first segment may show `translating...` briefly), and the model
+stays loaded for later sessions so subsequent Starts are sub-second.
+The WebSocket client runs on a background thread with 0.5 s -> 5 s capped
+backoff, so a restarted backend is picked up within five seconds; the status
+line shows `backend offline - retrying` in the meantime.
 
 ## ASR backends
 

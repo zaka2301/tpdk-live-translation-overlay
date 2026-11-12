@@ -173,7 +173,9 @@ def _config(tmp_path: Path) -> AppConfig:
     )
 
 
-def _ports(asr_client: FakeAsrClient) -> PipelinePorts:
+def _ports(
+    asr_client: FakeAsrClient, translator: Any | None = None
+) -> PipelinePorts:
     script = [np.full(FRAME, 0.4, dtype=np.float32)] * 10 + [
         np.zeros(FRAME, dtype=np.float32)
     ] * 10
@@ -181,7 +183,7 @@ def _ports(asr_client: FakeAsrClient) -> PipelinePorts:
     return PipelinePorts(
         audio_source=FakeAudioSource(script),
         asr_client=asr_client,
-        translator=FakeTranslator(),
+        translator=translator or FakeTranslator(),
         segmenter_factory=lambda: segmenter,
     )
 
@@ -348,4 +350,161 @@ def test_asr_failure_keeps_session_running(tmp_path: Path) -> None:
             ws,
             lambda message: message["type"] == "session.state"
             and message["state"] == "stopped",
+        )
+
+
+class SlowTranslator(FakeTranslator):
+    """First call outlives the 3 s stop budget; later calls must never run."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.calls = 0
+
+    def translate(
+        self,
+        texts: list[str],
+        *,
+        source_lang: str,
+        target_lang: str,
+    ) -> list[str]:
+        self.calls += 1
+        if self.calls == 1:
+            time.sleep(self.delay_s)
+        return super().translate(
+            texts, source_lang=source_lang, target_lang=target_lang
+        )
+
+
+def test_stop_does_not_touch_ports_held_by_a_slow_mt_thread(tmp_path: Path) -> None:
+    """Regression: stop() used to null/close ports while MT was still translating.
+
+    The MT thread then raised ``'NoneType' object has no attribute 'translator'``
+    and the overlay received a spurious ``mt_unavailable`` notice after stop.
+    """
+
+    translator = SlowTranslator(4.0)
+    loud = np.full(FRAME, 0.4, dtype=np.float32)
+    quiet = np.zeros(FRAME, dtype=np.float32)
+    script = ([loud] * 8 + [quiet] * 8) * 3
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource(script),
+            asr_client=FakeAsrClient(),
+            translator=translator,
+            segmenter_factory=FakeSegmenter,
+        )
+
+    app = create_app(_config(tmp_path), ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        started, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "starting",
+            timeout=10.0,
+        )
+        old_session_id = started["session_id"]
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "transcript.segment"
+            and message["status"] == "final"
+            and message.get("translation_status") == "pending",
+            timeout=10.0,
+        )
+        time.sleep(0.2)  # let the MT thread enter the slow translation
+
+        started = time.monotonic()
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+            timeout=6.0,
+        )
+        assert time.monotonic() - started < 5.5
+
+        # Start again immediately. start() must wait for the old MT worker, so
+        # the late translation is still tagged with the old session id and can
+        # never consume the new session's queue.
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        codes: list[str] = []
+        new_session_id = None
+        old_final_seen = False
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            message = _recv(ws, timeout=max(0.1, deadline - time.monotonic()))
+            if message["type"] == "notice":
+                codes.append(message["code"])
+            elif message["type"] == "session.state":
+                if message["state"] == "starting":
+                    new_session_id = message["session_id"]
+                elif message["state"] == "running":
+                    break
+            elif (
+                message["type"] == "transcript.segment"
+                and message["status"] == "final"
+                and message.get("translation_status") == "ok"
+                and message["session_id"] == old_session_id
+            ):
+                old_final_seen = True
+
+        assert old_final_seen, "the in-flight translation was lost"
+        assert new_session_id is not None and new_session_id != old_session_id
+        assert "mt_unavailable" not in codes
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+            timeout=6.0,
+        )
+
+
+class SlowWarmupTranslator(FakeTranslator):
+    """Model load takes 2 s; capture startup must not wait for it."""
+
+    def warmup(self) -> None:
+        time.sleep(2.0)
+
+
+def test_start_does_not_wait_for_translator_warmup(tmp_path: Path) -> None:
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return _ports(FakeAsrClient(), translator=SlowWarmupTranslator())
+
+    app = create_app(_config(tmp_path), ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        started = time.monotonic()
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "running",
+            timeout=2.0,
+        )
+        assert time.monotonic() - started < 1.0
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+            timeout=6.0,
         )

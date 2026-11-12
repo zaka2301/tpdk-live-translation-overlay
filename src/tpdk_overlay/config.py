@@ -78,7 +78,7 @@ class LlamaCppAsrConfig(_Section):
 
     base_url: str = "http://127.0.0.1:8081"
     max_new_tokens: int = Field(default=128, gt=0)
-    partial_interval_ms: int = Field(default=5000, gt=0)
+    partial_interval_ms: int = Field(default=2000, gt=0)
     partial_tail_sec: float = Field(default=4.0, gt=0)
     min_energy_dbfs: float = -40.0
     system_prompt: str = ""

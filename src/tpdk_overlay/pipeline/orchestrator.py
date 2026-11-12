@@ -75,7 +75,10 @@ from tpdk_overlay.utils.clock import Stopwatch, now_ms
 
 logger = logging.getLogger(__name__)
 
-_QUEUE_SIZE = 8
+_ASR_QUEUE_SIZE = 8
+# MT jobs are small; a deeper queue absorbs the one-time NLLB load without
+# dropping translations while source captions are already flowing.
+_MT_QUEUE_SIZE = 64
 _STOP_BUDGET_S = 3.0
 _PUT_BUDGET_S = 5.0
 _OCR_IDLE_WAIT_S = 0.2
@@ -159,7 +162,9 @@ class _TranslationJob:
     audio_end_to_text_ms: int
 
 
-def build_default_ports(config: AppConfig) -> PipelinePorts:
+def build_default_ports(
+    config: AppConfig, *, translator: Translator | None = None
+) -> PipelinePorts:
     """Build the production adapters; screen/OCR/summarizer appear in later phases.
 
     The optional imports are guarded so the phase 3 backend runs transcript-only
@@ -197,7 +202,7 @@ def build_default_ports(config: AppConfig) -> PipelinePorts:
     return PipelinePorts(
         audio_source=create_audio_source(config.audio),
         asr_client=create_asr_client(config.asr),
-        translator=create_translator(config.mt),
+        translator=translator or create_translator(config.mt),
         screen_source=screen_source,
         ocr_engine=ocr_engine,
         change_detector=change_detector,
@@ -250,8 +255,8 @@ class Orchestrator:
 
         self._stop_event = threading.Event()
         self._paused = threading.Event()
-        self._asr_queue: queue.Queue[Any] = queue.Queue(maxsize=_QUEUE_SIZE)
-        self._mt_queue: queue.Queue[Any] = queue.Queue(maxsize=_QUEUE_SIZE)
+        self._asr_queue: queue.Queue[Any] = queue.Queue(maxsize=_ASR_QUEUE_SIZE)
+        self._mt_queue: queue.Queue[Any] = queue.Queue(maxsize=_MT_QUEUE_SIZE)
         self._capture_thread: threading.Thread | None = None
         self._asr_thread: threading.Thread | None = None
         self._mt_thread: threading.Thread | None = None
@@ -312,6 +317,19 @@ class Orchestrator:
             to_nllb(command.target_lang)
         except ValueError as exc:
             self._notice(NoticeLevel.ERROR, "unsupported_language", str(exc))
+            return
+
+        # A slow NLLB call can outlive stop()'s 3 s budget. Starting a new
+        # session would reset the queues/stop event/session id while that
+        # worker is still alive, letting it consume the new session's work.
+        # Wait for the retired workers first; refuse if they are truly stuck.
+        retired = await self._wait_for_retired_workers()
+        if retired:
+            self._notice(
+                NoticeLevel.WARNING,
+                "session_stopping",
+                "the previous session is still shutting down; try again in a moment",
+            )
             return
 
         checkpoint_interval_s = (
@@ -379,22 +397,25 @@ class Orchestrator:
         deadline = time.monotonic() + _STOP_BUDGET_S
         ports = self._ports
         if ports is not None:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(ports.audio_source.stop)
-            self._join(self._capture_thread, deadline)
-            self._send_sentinel(self._asr_queue, deadline)
-            self._join(self._asr_thread, deadline)
-            self._send_sentinel(self._mt_queue, deadline)
-            self._join(self._mt_thread, deadline)
-            self._join(self._ocr_thread, deadline)
+            alive = await asyncio.to_thread(self._join_workers, ports, deadline)
             ports_to_release = self._ports
             self._ports = None
-            remaining = max(0.05, deadline - time.monotonic())
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._release_ports, ports_to_release),
-                    timeout=remaining,
+            if alive:
+                # A worker still holds a local ports reference (one slow model
+                # call). Closing its adapter here would be a use-after-close;
+                # leave the adapters alive and let the worker finish.
+                logger.warning(
+                    "workers still running after the stop budget (%s); "
+                    "adapters kept alive",
+                    ", ".join(alive),
                 )
+            else:
+                remaining = max(0.05, deadline - time.monotonic())
+                with contextlib.suppress(asyncio.TimeoutError, Exception):
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._release_ports, ports_to_release),
+                        timeout=remaining,
+                    )
 
         if self._session is not None:
             self._transition(SessionState.STOPPED)
@@ -524,9 +545,17 @@ class Orchestrator:
             ports = self._ports_factory(self._ports_config)
             self._ports = ports
             await asyncio.to_thread(ports.asr_client.warmup)
+            # NLLB loads in 12-23 s on this machine. Do not hold capture hostage
+            # to it: source captions should start now, and MT jobs queue behind
+            # the one-time load. Repeat sessions reuse the loaded model.
             translator_warmup = getattr(ports.translator, "warmup", None)
             if callable(translator_warmup):
-                await asyncio.to_thread(translator_warmup)
+                threading.Thread(
+                    target=self._warm_translator,
+                    args=(translator_warmup,),
+                    name="tpdk-mt-warm",
+                    daemon=True,
+                ).start()
             ocr_warmup = getattr(ports.ocr_engine, "warmup", None)
             if callable(ocr_warmup):
                 await asyncio.to_thread(ocr_warmup)
@@ -563,6 +592,13 @@ class Orchestrator:
             self._transition(SessionState.ERROR, detail=str(exc))
             self._notice(NoticeLevel.ERROR, "session_start_failed", str(exc))
 
+    @staticmethod
+    def _warm_translator(warmup: Any) -> None:
+        try:
+            warmup()
+        except Exception as exc:  # noqa: BLE001 - the MT worker reports real errors
+            logger.warning("translator warmup failed: %s", exc)
+
     def _default_segmenter_factory(self) -> SegmenterFactory:
         def build() -> Any:
             from tpdk_overlay.audio.vad import SileroVadSegmenter
@@ -573,18 +609,23 @@ class Orchestrator:
 
     def _start_threads(self) -> None:
         assert self._ports is not None
+        ports = self._ports
         self._capture_thread = threading.Thread(
-            target=self._capture_loop, name="tpdk-capture", daemon=True
+            target=self._capture_loop, args=(ports,), name="tpdk-capture", daemon=True
         )
-        self._asr_thread = threading.Thread(target=self._asr_loop, name="tpdk-asr", daemon=True)
-        self._mt_thread = threading.Thread(target=self._mt_loop, name="tpdk-mt", daemon=True)
+        self._asr_thread = threading.Thread(
+            target=self._asr_loop, args=(ports,), name="tpdk-asr", daemon=True
+        )
+        self._mt_thread = threading.Thread(
+            target=self._mt_loop, args=(ports,), name="tpdk-mt", daemon=True
+        )
         self._capture_thread.start()
         self._asr_thread.start()
         self._mt_thread.start()
 
-        if self._ports.screen_source is not None and self._ports.ocr_engine is not None:
+        if ports.screen_source is not None and ports.ocr_engine is not None:
             self._ocr_thread = threading.Thread(
-                target=self._ocr_loop, name="tpdk-ocr", daemon=True
+                target=self._ocr_loop, args=(ports,), name="tpdk-ocr", daemon=True
             )
             self._ocr_thread.start()
         elif self._config.screen.enabled and self._config.ocr.enabled:
@@ -611,9 +652,9 @@ class Orchestrator:
 
     # -- capture / VAD -----------------------------------------------------
 
-    def _capture_loop(self) -> None:
-        assert self._ports is not None and self._segmenter is not None
-        source = self._ports.audio_source
+    def _capture_loop(self, ports: PipelinePorts) -> None:
+        assert self._segmenter is not None
+        source = ports.audio_source
         segmenter = self._segmenter
         stream_open = False
         stream_t_end_ms = 0
@@ -701,8 +742,7 @@ class Orchestrator:
 
     # -- ASR ---------------------------------------------------------------
 
-    def _asr_loop(self) -> None:
-        assert self._ports is not None
+    def _asr_loop(self, ports: PipelinePorts) -> None:
         stream = None
         segment_id = 0
         t_start_ms = 0
@@ -722,7 +762,7 @@ class Orchestrator:
                         if stream is not None:
                             with contextlib.suppress(Exception):
                                 stream.close()
-                        stream = self._ports.asr_client.open(
+                        stream = ports.asr_client.open(
                             language=self._settings.source_lang
                         )
                         segment_id = item.segment_id
@@ -913,18 +953,23 @@ class Orchestrator:
 
     # -- MT ----------------------------------------------------------------
 
-    def _mt_loop(self) -> None:
-        assert self._ports is not None
+    def _mt_loop(self, ports: PipelinePorts) -> None:
         while True:
             job = self._mt_queue.get()
             if job is _SENTINEL:
                 break
             assert isinstance(job, _TranslationJob)
+            if self._stop_event.is_set():
+                # Shutdown: do not start another model call. Resolve the
+                # segment as skipped so no client is left with a permanently
+                # pending translation, and drain the queue quickly.
+                self._emit_shutdown_skip(job)
+                continue
             translation: str | None = None
             status = TranslationStatus.FAILED
             stopwatch = Stopwatch()
             try:
-                [translation] = self._ports.translator.translate(
+                [translation] = ports.translator.translate(
                     [job.text],
                     source_lang=job.source_lang,
                     target_lang=job.target_lang,
@@ -967,6 +1012,32 @@ class Orchestrator:
                     "persist_error",
                     f"failed to persist segment {event.segment_id}: {exc}",
                 )
+
+    def _emit_shutdown_skip(self, job: _TranslationJob) -> None:
+        """Resolve a queued translation as skipped instead of starting inference."""
+
+        event = TranscriptSegmentEvent(
+            session_id=self.session_id,
+            segment_id=job.segment_id,
+            revision=job.revision + 1,
+            status=SegmentStatus.FINAL,
+            t_start_ms=job.t_start_ms,
+            t_end_ms=job.t_end_ms,
+            source_lang=job.source_lang,
+            target_lang=job.target_lang,
+            text=job.text,
+            translation=None,
+            translation_status=TranslationStatus.SKIPPED,
+            asr_latency_ms=job.asr_latency_ms,
+            mt_latency_ms=0,
+            audio_end_to_text_ms=job.audio_end_to_text_ms,
+            audio_end_ts_ms=job.audio_end_ts_ms,
+        )
+        try:
+            self._emit_transcript(event)
+            self._persist_transcript(event, None)
+        except Exception as exc:  # noqa: BLE001 - stop must not be blocked by a write
+            logger.warning("failed to resolve skipped segment %d: %s", job.segment_id, exc)
 
     def _put_mt(self, job: _TranslationJob) -> bool:
         deadline = time.monotonic() + _PUT_BUDGET_S
@@ -1044,11 +1115,9 @@ class Orchestrator:
 
     # -- OCR ---------------------------------------------------------------
 
-    def _ocr_loop(self) -> None:
-        assert self._ports is not None
-        assert self._ports.screen_source is not None
-        assert self._ports.ocr_engine is not None
-        ports = self._ports
+    def _ocr_loop(self, ports: PipelinePorts) -> None:
+        assert ports.screen_source is not None
+        assert ports.ocr_engine is not None
         interval_s = max(0.1, self._config.screen.capture_interval_ms / 1000.0)
         while not self._stop_event.is_set():
             settings = self._settings
@@ -1089,7 +1158,7 @@ class Orchestrator:
         if not lines:
             return
 
-        blocks = self._group_blocks(lines)
+        blocks = self._group_blocks(lines, ports)
         mt_ms: int | None = None
         stopwatch = Stopwatch()
         try:
@@ -1141,10 +1210,11 @@ class Orchestrator:
                 }
             )
 
-    def _group_blocks(self, lines: Sequence[OcrLine]) -> tuple[OcrBlock, ...]:
-        assert self._ports is not None
-        if self._ports.block_grouper is not None:
-            blocks = tuple(self._ports.block_grouper(lines))
+    def _group_blocks(
+        self, lines: Sequence[OcrLine], ports: PipelinePorts
+    ) -> tuple[OcrBlock, ...]:
+        if ports.block_grouper is not None:
+            blocks = tuple(ports.block_grouper(lines))
         else:
             blocks = tuple(
                 OcrBlock(
@@ -1300,6 +1370,36 @@ class Orchestrator:
 
     # -- lifecycle helpers -------------------------------------------------
 
+    def _live_workers(self) -> list[threading.Thread]:
+        threads = (
+            self._capture_thread,
+            self._asr_thread,
+            self._mt_thread,
+            self._ocr_thread,
+        )
+        return [thread for thread in threads if thread is not None and thread.is_alive()]
+
+    @staticmethod
+    def _join_threads(threads: list[threading.Thread], deadline: float) -> None:
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(timeout=remaining)
+
+    async def _wait_for_retired_workers(self, timeout_s: float = 6.0) -> list[str]:
+        """Block a new session until workers from the previous one have exited."""
+
+        live = self._live_workers()
+        if not live:
+            return []
+        logger.info(
+            "waiting for previous workers before starting a new session: %s",
+            ", ".join(thread.name for thread in live),
+        )
+        deadline = time.monotonic() + timeout_s
+        await asyncio.to_thread(self._join_threads, live, deadline)
+        return [thread.name for thread in live if thread.is_alive()]
+
     def _reset_session_state(self) -> None:
         self._session = None
         self._metrics = None
@@ -1312,8 +1412,8 @@ class Orchestrator:
         self._partial_event = None
         self._stop_event = threading.Event()
         self._paused = threading.Event()
-        self._asr_queue = queue.Queue(maxsize=_QUEUE_SIZE)
-        self._mt_queue = queue.Queue(maxsize=_QUEUE_SIZE)
+        self._asr_queue = queue.Queue(maxsize=_ASR_QUEUE_SIZE)
+        self._mt_queue = queue.Queue(maxsize=_MT_QUEUE_SIZE)
         self._capture_thread = None
         self._asr_thread = None
         self._mt_thread = None
@@ -1379,6 +1479,25 @@ class Orchestrator:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+    def _join_workers(self, ports: PipelinePorts, deadline: float) -> list[str]:
+        """Stop capture and join workers without blocking the event loop."""
+
+        with contextlib.suppress(Exception):
+            ports.audio_source.stop()
+        self._join(self._capture_thread, deadline)
+        self._send_sentinel(self._asr_queue, deadline)
+        self._join(self._asr_thread, deadline)
+        self._send_sentinel(self._mt_queue, deadline)
+        self._join(self._mt_thread, deadline)
+        self._join(self._ocr_thread, deadline)
+        threads = (
+            self._capture_thread,
+            self._asr_thread,
+            self._mt_thread,
+            self._ocr_thread,
+        )
+        return [thread.name for thread in threads if thread is not None and thread.is_alive()]
 
     @staticmethod
     def _join(thread: threading.Thread | None, deadline: float) -> None:

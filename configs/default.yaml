@@ -42,7 +42,7 @@ asr:
     #     -ngl all -c 4096 -np 1 -n 128 --cache-type-k q8_0 --cache-type-v q8_0
     base_url: http://127.0.0.1:8081
     max_new_tokens: 128        # hard cap per request; partial previews use min(64, this)
-    partial_interval_ms: 5000  # preview cadence over the last partial_tail_sec of audio
+    partial_interval_ms: 2000  # preview cadence over the last partial_tail_sec of audio
     partial_tail_sec: 4.0      # partial prompt window; kept short to bound latency
     min_energy_dbfs: -40.0     # windows quieter than this never reach the server
     system_prompt: ""          # experimental; empty = no system message

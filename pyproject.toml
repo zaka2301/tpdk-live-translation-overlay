@@ -54,6 +54,7 @@ dev = [
 
 [project.scripts]
 tpdk-backend = "tpdk_overlay.server.app:main"
+tpdk-overlay = "tpdk_overlay.ui.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tpdk_overlay"]
