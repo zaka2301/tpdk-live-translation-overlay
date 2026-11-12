@@ -166,6 +166,7 @@ class CaptionWindow(QWidget):
     regionRequested = Signal()
     languagesChanged = Signal(str, str)
     intervalChanged = Signal(int)
+    finalPainted = Signal(object)
 
     def __init__(
         self,
@@ -187,12 +188,23 @@ class CaptionWindow(QWidget):
         self._state = SessionState.IDLE
         self._connected = False
         self._region: ScreenRegion | None = None
-        self._segment_id: int | None = None
-        self._revision = -1
         self._drag_offset: QPoint | None = None
         self._notice_text = ""
         self._notice_color = theme.STATUS_TEXT
         self._notice_until = 0.0
+        self._full_source = ""
+        self._full_translation = ""
+        self._segment_final = False
+        self._revisions: dict[int, int] = {}
+        self._pending: TranscriptSegmentEvent | None = None
+        self._final_hold_ms = int(ui.caption.final_hold_ms)
+        self._hold_until = 0.0
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        # PreciseTimer never fires before _hold_until; _release_pending still
+        # re-arms for any remaining time as a backstop.
+        self._hold_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._hold_timer.timeout.connect(self._release_pending)
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -372,30 +384,126 @@ class CaptionWindow(QWidget):
         self._refresh_status()
 
     def clear_caption(self) -> None:
-        self._segment_id = None
-        self._revision = -1
+        self._hold_timer.stop()
+        self._hold_until = 0.0
+        self._pending = None
+        self._revisions.clear()
+        self._full_source = ""
+        self._full_translation = ""
+        self._segment_final = False
         self._source_label.clear()
         self._translation_label.clear()
 
     def show_segment(self, event: TranscriptSegmentEvent) -> None:
-        """Apply a partial or final revision, ignoring stale revisions."""
+        """Apply a partial/final, or queue it while a final is being read.
 
-        if event.segment_id != self._segment_id:
-            self._segment_id = event.segment_id
-            self._revision = -1
-        if event.revision <= self._revision:
+        A translated final starts a short reading hold; partials and source-only
+        pending finals that arrive during it are coalesced and shown when it
+        expires. Resolved finals always paint, so a slow translation is neither
+        overwritten by the next utterance nor lost from NFR-01 metrics.
+        """
+
+        last = self._revisions.get(event.segment_id)
+        if last is not None and event.revision <= last:
             return
-        self._revision = event.revision
+        self._revisions[event.segment_id] = event.revision
+        if len(self._revisions) > 64:
+            cutoff = event.segment_id - 32
+            self._revisions = {
+                segment_id: revision
+                for segment_id, revision in self._revisions.items()
+                if segment_id >= cutoff
+            }
+
+        now = time.monotonic()
+        if self._is_resolved_final(event):
+            # A resolved final must always paint: render.ack drives NFR-01,
+            # and skipping one would silently drop its metrics row.
+            self._hold_timer.stop()
+            self._hold_until = 0.0
+            self._pending = None
+            self._show_event(event)
+            return
+        if self._hold_until and now >= self._hold_until:
+            # The hold expired but its timer callback has not run yet. Fold
+            # this preview into the pending slot instead of painting it and
+            # letting the stale callback overwrite it with an older event.
+            self._release_expired_hold(event)
+            return
+        if self._hold_until > now:
+            self._buffer_event(event)
+            return
+        self._show_event(event)
+
+    def _show_event(self, event: TranscriptSegmentEvent) -> None:
+        """Render the event immediately; a translated final starts a hold."""
 
         final = event.status is SegmentStatus.FINAL
+        self._segment_final = final
         source_font = self._source_label.font()
         source_font.setItalic(not final)
         self._source_label.setFont(source_font)
-        self._source_label.setText(event.text)
-
-        self._translation_label.setText(self._translation_text(event))
+        self._full_source = event.text
+        self._full_translation = self._translation_text(event)
+        self._apply_fitted_text()
         self._translation_label.setStyleSheet(
             f"color: {self._translation_color(event)};"
+        )
+        if final:
+            self.finalPainted.emit(event)
+            if self._is_translated_final(event):
+                self._start_hold()
+
+    def _start_hold(self) -> None:
+        if self._final_hold_ms <= 0:
+            return
+        self._hold_until = time.monotonic() + self._final_hold_ms / 1000
+        self._hold_timer.start(self._final_hold_ms)
+
+    def _release_pending(self) -> None:
+        now = time.monotonic()
+        if now < self._hold_until:
+            # An early/stale timeout; re-arm for the remaining hold instead of
+            # leaving the pending preview with no timer to release it.
+            remaining = int((self._hold_until - now) * 1000) + 1
+            self._hold_timer.start(max(1, remaining))
+            return
+        self._release_expired_hold()
+
+    def _release_expired_hold(
+        self, event: TranscriptSegmentEvent | None = None
+    ) -> None:
+        """Show the newest pending preview after the hold has elapsed."""
+
+        self._hold_timer.stop()
+        self._hold_until = 0.0
+        if event is not None:
+            self._buffer_event(event)
+        pending = self._pending
+        self._pending = None
+        if pending is not None:
+            self._show_event(pending)
+
+    def _buffer_event(self, event: TranscriptSegmentEvent) -> None:
+        # Only previews are buffered: partials and source-only finals. A newer
+        # segment wins; resolved finals bypass the buffer entirely.
+        pending = self._pending
+        if pending is None or event.segment_id >= pending.segment_id:
+            self._pending = event
+
+    @staticmethod
+    def _is_resolved_final(event: TranscriptSegmentEvent) -> bool:
+        return (
+            event.status is SegmentStatus.FINAL
+            and event.translation_status is not TranslationStatus.PENDING
+        )
+
+    @staticmethod
+    def _is_translated_final(event: TranscriptSegmentEvent) -> bool:
+        return (
+            event.status is SegmentStatus.FINAL
+            and event.translation_status is TranslationStatus.OK
+            and bool(event.translation)
         )
 
     def show_notice(self, level: NoticeLevel, message: str) -> None:
@@ -404,6 +512,76 @@ class CaptionWindow(QWidget):
         self._notice_until = time.monotonic() + 8.0
         self._refresh_status()
         QTimer.singleShot(8500, self._refresh_status)
+
+    def _apply_fitted_text(self) -> None:
+        """Show as much as fits; the full text still lives in history."""
+
+        if self.layout() is not None:
+            self.layout().activate()
+        self._fit_text(
+            self._source_label,
+            self._full_source,
+            keep_tail=not self._segment_final,
+            max_height=self._source_label.maximumHeight(),
+        )
+        # The source text just changed; let the layout shrink the translation
+        # label before deciding how many lines of it fit.
+        if self.layout() is not None:
+            self.layout().invalidate()
+            self.layout().activate()
+        self._fit_text(
+            self._translation_label,
+            self._full_translation,
+            keep_tail=not self._segment_final,
+            max_height=max(0, self._translation_label.height() - 4),
+        )
+
+    @staticmethod
+    def _fit_text(
+        label: QLabel,
+        text: str,
+        *,
+        keep_tail: bool,
+        max_height: int,
+    ) -> None:
+        if not text:
+            label.clear()
+            return
+        width = label.width()
+        height = max_height if 0 < max_height < 10_000 else label.height()
+        if width <= 0 or height <= 0:
+            label.setText(text)
+            return
+
+        metrics = QFontMetrics(label.font())
+        flags = Qt.TextFlag.TextWordWrap
+
+        def measure(candidate: str) -> int:
+            return metrics.boundingRect(
+                QRect(0, 0, width, 10_000), flags, candidate
+            ).height()
+
+        if measure(text) <= height:
+            label.setText(text)
+            return
+
+        words = text.split()
+        prefix = "… " if keep_tail else ""
+        suffix = "" if keep_tail else " …"
+        low, high = 0, len(words)
+        while low < high:
+            middle = (low + high + 1) // 2
+            subset = words[-middle:] if keep_tail else words[:middle]
+            candidate = prefix + " ".join(subset) + suffix
+            if measure(candidate) <= height:
+                low = middle
+            else:
+                high = middle - 1
+        if low <= 0:
+            label.setText("…")
+            return
+        subset = words[-low:] if keep_tail else words[:low]
+        label.setText(prefix + " ".join(subset) + suffix)
 
     def paint_now(self) -> None:
         """Force an immediate paint so a render ack carries a real timestamp."""
@@ -453,6 +631,14 @@ class CaptionWindow(QWidget):
     def resizeEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().resizeEvent(event)
         self._grip.move(self.width() - GRIP_SIZE - 2, self.height() - GRIP_SIZE - 2)
+        if hasattr(self, "_source_label"):
+            self._apply_fitted_text()
+
+    def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        # Re-fit after a hidden window is shown; show() is not guaranteed to
+        # emit resizeEvent when the geometry did not change.
+        self._apply_fitted_text()
 
     def paintEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         painter = QPainter(self)

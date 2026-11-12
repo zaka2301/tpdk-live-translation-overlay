@@ -19,7 +19,7 @@ from PySide6.QtGui import QGuiApplication, QMouseEvent
 from PySide6.QtWidgets import QApplication
 from websockets.sync.server import ServerConnection, serve
 
-from tpdk_overlay.config import UiConfig
+from tpdk_overlay.config import CaptionConfig, UiConfig
 from tpdk_overlay.contracts import (
     PingCommand,
     PongEvent,
@@ -353,4 +353,405 @@ def test_region_picker_reports_physical_pixels(qt_app: QApplication) -> None:
     finally:
         picker.close()
         picker.deleteLater()
+        qt_app.processEvents()
+
+
+def test_caption_trims_overflow_but_keeps_full_text_in_history(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=0)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    window.show()
+    qt_app.processEvents()
+    try:
+        long_text = " ".join(f"word{index}" for index in range(200))
+        window.show_segment(
+            TranscriptSegmentEvent(
+                segment_id=3,
+                revision=2,
+                status=SegmentStatus.FINAL,
+                t_start_ms=0,
+                t_end_ms=10_000,
+                source_lang="en",
+                target_lang="id",
+                text=long_text,
+                translation=long_text,
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        qt_app.processEvents()
+        source, translation = window.current_text()
+        assert len(source) < len(long_text) and source.endswith("…")
+        assert len(translation) < len(long_text) and translation.endswith("…")
+
+        window.show_segment(
+            TranscriptSegmentEvent(
+                segment_id=4,
+                revision=2,
+                status=SegmentStatus.PARTIAL,
+                t_start_ms=10_000,
+                t_end_ms=20_000,
+                source_lang="en",
+                target_lang="id",
+                text=long_text,
+            )
+        )
+        qt_app.processEvents()
+        assert window.current_text()[0].startswith("… ")
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_final_translation_holds_before_next_partial(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=120)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    painted: list[TranscriptSegmentEvent] = []
+    window.finalPainted.connect(painted.append)
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First sentence",
+                "Kalimat pertama",
+                TranslationStatus.OK,
+            )
+        )
+        assert window.current_text() == ("First sentence", "Kalimat pertama")
+        assert len(painted) == 1
+
+        # The next utterance arrives while the translated final is still held.
+        window.show_segment(
+            event(2, 1, SegmentStatus.PARTIAL, "Second sentence")
+        )
+        assert window.current_text() == ("First sentence", "Kalimat pertama")
+        assert len(painted) == 1
+
+        time.sleep(0.15)
+        qt_app.processEvents()
+        assert window.current_text() == ("Second sentence", "")
+        assert len(painted) == 1
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_new_resolved_final_stops_the_old_hold(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=60)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First",
+                "Satu",
+                TranslationStatus.OK,
+            )
+        )
+        # Let the first hold expire in time, but do not run the event loop yet:
+        # the second final arrives before the stale timer callback is delivered.
+        time.sleep(0.09)
+        window.show_segment(
+            event(
+                2,
+                2,
+                SegmentStatus.FINAL,
+                "Second",
+                "Dua",
+                TranslationStatus.OK,
+            )
+        )
+        assert window.current_text() == ("Second", "Dua")
+
+        qt_app.processEvents()  # deliver the stale first timer
+        window.show_segment(
+            event(3, 1, SegmentStatus.PARTIAL, "Third")
+        )
+        assert window.current_text() == ("Second", "Dua")
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_resolved_final_is_painted_during_hold(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=5_000)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    painted: list[TranscriptSegmentEvent] = []
+    window.finalPainted.connect(painted.append)
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First",
+                "Satu",
+                TranslationStatus.OK,
+            )
+        )
+        # A resolved final must paint even though the previous hold is active:
+        # otherwise its render.ack would never reach metrics.csv.
+        window.show_segment(
+            event(
+                2,
+                2,
+                SegmentStatus.FINAL,
+                "Second",
+                "Dua",
+                TranslationStatus.OK,
+            )
+        )
+        assert window.current_text() == ("Second", "Dua")
+        assert len(painted) == 2
+
+        window.show_segment(event(3, 1, SegmentStatus.PARTIAL, "Third"))
+        assert window.current_text() == ("Second", "Dua")
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_early_hold_timeout_rearms_instead_of_dropping_pending(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=5_000)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First",
+                "Satu",
+                TranslationStatus.OK,
+            )
+        )
+        window.show_segment(event(2, 1, SegmentStatus.PARTIAL, "Second"))
+
+        # Simulate a CoarseTimer firing early: the pending preview must stay
+        # buffered and the hold timer must be re-armed for the remaining time.
+        window._hold_timer.timeout.emit()
+        assert window.current_text() == ("First", "Satu")
+        assert window._hold_timer.isActive()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_expired_hold_uses_the_newest_preview(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(caption=CaptionConfig(final_hold_ms=60)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+
+    def event(
+        segment_id: int,
+        revision: int,
+        status: SegmentStatus,
+        text: str,
+        translation: str | None = None,
+        translation_status: TranslationStatus = TranslationStatus.PENDING,
+    ) -> TranscriptSegmentEvent:
+        return TranscriptSegmentEvent(
+            segment_id=segment_id,
+            revision=revision,
+            status=status,
+            t_start_ms=0,
+            t_end_ms=2_000,
+            source_lang="en",
+            target_lang="id",
+            text=text,
+            translation=translation,
+            translation_status=translation_status,
+        )
+
+    try:
+        window.show_segment(
+            event(
+                1,
+                2,
+                SegmentStatus.FINAL,
+                "First",
+                "Satu",
+                TranslationStatus.OK,
+            )
+        )
+        window.show_segment(event(2, 1, SegmentStatus.PARTIAL, "Second"))
+
+        # Let the hold expire in time without delivering the timer callback,
+        # then paint a newer preview before the stale callback can run.
+        time.sleep(0.09)
+        window.show_segment(event(3, 1, SegmentStatus.PARTIAL, "Third"))
+        assert window.current_text() == ("Third", "")
+
+        qt_app.processEvents()
+        assert window.current_text() == ("Third", "")
+        assert not window._hold_timer.isActive()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_caption_fits_long_text_while_hidden_and_after_show(
+    qt_app: QApplication,
+) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        long_text = " ".join(f"word{index}" for index in range(200))
+        window.show_segment(
+            TranscriptSegmentEvent(
+                segment_id=5,
+                revision=2,
+                status=SegmentStatus.FINAL,
+                t_start_ms=0,
+                t_end_ms=10_000,
+                source_lang="en",
+                target_lang="id",
+                text=long_text,
+                translation=long_text,
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        hidden_translation = window.current_text()[1]
+        assert hidden_translation.endswith("…")
+
+        window.show()
+        qt_app.processEvents()
+        shown_translation = window.current_text()[1]
+        assert shown_translation.endswith("…")
+        assert len(shown_translation) <= len(long_text)
+    finally:
+        window.close()
+        window.deleteLater()
         qt_app.processEvents()

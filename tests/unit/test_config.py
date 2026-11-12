@@ -17,6 +17,8 @@ def test_default_config_loads() -> None:
     assert config.asr.llama_cpp.base_url == "http://127.0.0.1:8081"
     assert config.asr.llama_cpp.max_new_tokens == 128
     assert config.asr.llama_cpp.partial_interval_ms == 2000
+    assert config.audio.vad.max_utterance_ms == 10_000
+    assert config.ui.caption.height == 260
     assert config.asr.llama_cpp.partial_tail_sec == 4.0
     assert config.asr.llama_cpp.min_energy_dbfs == -40.0
     assert config.ocr.det_model == "PP-OCRv6_small_det"

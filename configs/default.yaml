@@ -23,7 +23,7 @@ audio:
     threshold: 0.5
     min_speech_ms: 250
     min_silence_ms: 450
-    max_utterance_ms: 20000
+    max_utterance_ms: 10000  # hard subtitle cap; longer speech becomes a new segment
     pre_roll_ms: 300
 
 asr:
@@ -93,12 +93,13 @@ summary:
 ui:
   caption:
     width: 1100
-    height: 220
+    height: 260           # fits ~3-4 translation lines at the default font
     anchor: bottom-center
-    opacity: 0.85
+    opacity: 0.55
     font_family: Segoe UI
-    font_size: 20
-    translation_font_size: 22
+    font_size: 18
+    translation_font_size: 18
+    final_hold_ms: 2200     # minimum reading time for a translated final
   ocr_overlay:
     enabled: true
     background: "#101418"

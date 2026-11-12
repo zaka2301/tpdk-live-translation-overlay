@@ -61,7 +61,7 @@ class VadConfig(_Section):
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     min_speech_ms: int = Field(default=250, ge=0)
     min_silence_ms: int = Field(default=450, ge=0)
-    max_utterance_ms: int = Field(default=20_000, gt=0)
+    max_utterance_ms: int = Field(default=10_000, gt=0)
     pre_roll_ms: int = Field(default=300, ge=0)
 
 
@@ -169,12 +169,15 @@ class SummaryConfig(_Section):
 
 class CaptionConfig(_Section):
     width: int = Field(default=1100, gt=0)
-    height: int = Field(default=220, gt=0)
+    height: int = Field(default=260, gt=0)
     anchor: Literal["bottom-center", "bottom-left", "bottom-right", "top-center"] = "bottom-center"
     opacity: float = Field(default=0.85, ge=0.0, le=1.0)
     font_family: str = "Segoe UI"
     font_size: int = Field(default=20, gt=0)
     translation_font_size: int = Field(default=22, gt=0)
+    # Minimum time a translated final remains before the next segment may
+    # replace it; the caption coalesces events while it is held.
+    final_hold_ms: int = Field(default=2200, ge=0, le=10_000)
 
 
 class OcrOverlayConfig(_Section):

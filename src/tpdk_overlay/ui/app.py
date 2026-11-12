@@ -240,6 +240,7 @@ class OverlayApp(QObject):
         self._caption.regionRequested.connect(self._pick_region)
         self._caption.languagesChanged.connect(self._on_languages_changed)
         self._caption.intervalChanged.connect(self._on_interval_changed)
+        self._caption.finalPainted.connect(self._ack)
         self._client.eventReceived.connect(self._on_event)
         self._client.connected.connect(self._on_connected)
         self._client.disconnected.connect(self._on_disconnected)
@@ -365,7 +366,6 @@ class OverlayApp(QObject):
                         else None
                     ),
                 )
-                self._ack(event)
         elif isinstance(event, NoticeEvent):
             self._caption.show_notice(event.level, event.message)
             if event.level is NoticeLevel.ERROR and self._tray is not None:
@@ -399,7 +399,7 @@ class OverlayApp(QObject):
         self._update_actions()
 
     def _ack(self, event: TranscriptSegmentEvent) -> None:
-        """Report the paint time for NFR-01, but only if something was painted."""
+        """Report the paint time for NFR-01 when a final was actually shown."""
 
         if not self._caption.isVisible():
             return
