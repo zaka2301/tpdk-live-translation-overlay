@@ -64,6 +64,32 @@ class _SharedTranslator:
         return getattr(self._inner, name)
 
 
+class _SharedOcrEngine:
+    """Session-scoped OCR handle backed by one process-wide PaddleOCR.
+
+    Loading PP-OCRv6 takes ~18 s; recreating it for every Start would delay the
+    first slide and churn memory. ``close`` is a no-op per session; the model
+    cache closes the real engine at backend shutdown.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def warmup(self) -> None:
+        warmup = getattr(self._inner, "warmup", None)
+        if callable(warmup):
+            warmup()
+
+    def recognize(self, image: Any) -> Any:
+        return self._inner.recognize(image)
+
+    def close(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class _ModelCache:
     """Load expensive local models once per backend process, not per session."""
 
@@ -72,6 +98,8 @@ class _ModelCache:
         self._lock = threading.Lock()
         self._inner: Any | None = None
         self._key: str | None = None
+        self._ocr_inner: Any | None = None
+        self._ocr_key: str | None = None
 
     def _inner_for(self, config: AppConfig) -> Any:
         try:
@@ -93,41 +121,80 @@ class _ModelCache:
                 self._key = key
             return self._inner
 
+    def _ocr_for(self, config: AppConfig) -> Any:
+        try:
+            key = config.ocr.model_dump_json()
+        except AttributeError:  # pragma: no cover - config is pydantic today
+            key = repr(config.ocr)
+        with self._lock:
+            if self._ocr_inner is None or self._ocr_key != key:
+                if self._ocr_inner is not None:
+                    threading.Thread(
+                        target=self._close_inner,
+                        args=(self._ocr_inner,),
+                        name="tpdk-ocr-close",
+                        daemon=True,
+                    ).start()
+                from tpdk_overlay.ocr.paddle import PaddleOcrEngine
+
+                self._ocr_inner = PaddleOcrEngine(config.ocr)
+                self._ocr_key = key
+            return self._ocr_inner
+
     def ports_factory(self, config: AppConfig) -> PipelinePorts:
+        ocr_engine = (
+            _SharedOcrEngine(self._ocr_for(config))
+            if config.screen.enabled and config.ocr.enabled
+            else None
+        )
         return build_default_ports(
-            config, translator=_SharedTranslator(self._inner_for(config))
+            config,
+            translator=_SharedTranslator(self._inner_for(config)),
+            ocr_engine=ocr_engine,
         )
 
     def preload(self) -> None:
-        """Warm the model while the overlay is coming up, off the event loop."""
+        """Warm the models while the overlay is coming up, off the event loop."""
 
         translator = _SharedTranslator(self._inner_for(self._config))
         threading.Thread(
             target=self._preload,
-            args=(translator,),
+            args=("translator", translator),
             name="tpdk-mt-preload",
             daemon=True,
         ).start()
+        if self._config.screen.enabled and self._config.ocr.enabled:
+            ocr = _SharedOcrEngine(self._ocr_for(self._config))
+            threading.Thread(
+                target=self._preload,
+                args=("OCR", ocr),
+                name="tpdk-ocr-preload",
+                daemon=True,
+            ).start()
 
     @staticmethod
-    def _preload(translator: _SharedTranslator) -> None:
+    def _preload(name: str, adapter: Any) -> None:
         try:
-            translator.warmup()
-        except Exception:  # noqa: BLE001 - the first translate retries and reports
-            logger.exception("translator preload failed")
+            adapter.warmup()
+        except Exception:  # noqa: BLE001 - the first real pass retries and reports
+            logger.exception("%s preload failed", name)
 
     def close(self) -> None:
         with self._lock:
             inner = self._inner
+            ocr_inner = self._ocr_inner
             self._inner = None
             self._key = None
-        if inner is not None:
-            threading.Thread(
-                target=self._close_inner,
-                args=(inner,),
-                name="tpdk-mt-close",
-                daemon=True,
-            ).start()
+            self._ocr_inner = None
+            self._ocr_key = None
+        for name, model in (("tpdk-mt-close", inner), ("tpdk-ocr-close", ocr_inner)):
+            if model is not None:
+                threading.Thread(
+                    target=self._close_inner,
+                    args=(model,),
+                    name=name,
+                    daemon=True,
+                ).start()
 
     @staticmethod
     def _close_inner(inner: Any) -> None:

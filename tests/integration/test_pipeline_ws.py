@@ -24,8 +24,10 @@ from fastapi.testclient import TestClient
 from tpdk_overlay.asr.errors import AsrUnavailable
 from tpdk_overlay.audio.vad import VAD_FRAME_MS, VAD_FRAME_SAMPLES, SpeechStart, Utterance
 from tpdk_overlay.config import AppConfig, load_config
+from tpdk_overlay.contracts import BBox
 from tpdk_overlay.pipeline.orchestrator import PipelinePorts
-from tpdk_overlay.ports import AsrUpdate
+from tpdk_overlay.ports import AsrUpdate, OcrLine
+from tpdk_overlay.screen.change import SlideChangeDetector
 from tpdk_overlay.server.app import create_app
 
 FRAME = VAD_FRAME_SAMPLES
@@ -176,6 +178,37 @@ class FakeTranslator:
 
     def close(self) -> None:
         pass
+
+
+class FakeScreenSource:
+    """Return whatever frame the test currently wants the slide to show."""
+
+    def __init__(self, frame: np.ndarray) -> None:
+        self.frame = frame
+        self.captures = 0
+
+    def capture(self, region: object) -> np.ndarray:
+        self.captures += 1
+        return self.frame.copy()
+
+
+class FakeOcrEngine:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.result = [
+            OcrLine(
+                text="Slide heading",
+                bbox=BBox(x=10, y=10, w=200, h=30),
+                confidence=0.95,
+            )
+        ]
+
+    def warmup(self) -> None:
+        pass
+
+    def recognize(self, image: np.ndarray) -> list[OcrLine]:
+        self.calls += 1
+        return list(self.result)
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -671,4 +704,240 @@ def test_start_does_not_wait_for_translator_warmup(tmp_path: Path) -> None:
             lambda message: message["type"] == "session.state"
             and message["state"] == "stopped",
             timeout=6.0,
+        )
+
+
+def test_ocr_frames_follow_slide_changes(tmp_path: Path) -> None:
+    """Static slides OCR once; a changed slide produces a new frame quickly."""
+
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={
+            "screen": base.screen.model_copy(
+                update={"enabled": True, "capture_interval_ms": 100}
+            ),
+            "ocr": base.ocr.model_copy(update={"enabled": True}),
+        }
+    )
+    source = FakeScreenSource(np.zeros((90, 160, 3), dtype=np.uint8))
+    engine = FakeOcrEngine()
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource([]),
+            asr_client=FakeAsrClient(),
+            translator=FakeTranslator(),
+            segmenter_factory=FakeSegmenter,
+            screen_source=source,
+            ocr_engine=engine,
+            change_detector=SlideChangeDetector(config.screen),
+        )
+
+    app = create_app(config, ports_factory=factory)
+    region = {"left": 0, "top": 0, "width": 160, "height": 90, "monitor": 1}
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "source_lang": "en",
+                    "target_lang": "id",
+                    "region": region,
+                }
+            )
+        )
+
+        first, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "ocr.frame",
+            timeout=5.0,
+        )
+        assert first["region"]["width"] == 160
+        assert len(first["blocks"]) == 1
+        block = first["blocks"][0]
+        assert block["text"] == "Slide heading"
+        assert block["translation"] == "[id] Slide heading"
+        assert block["translation_status"] == "ok"
+        assert first["change_ts_ms"] is not None
+        assert engine.calls == 1
+
+        # The next pass sees an identical slide and must not emit another frame.
+        time.sleep(0.4)
+        assert engine.calls == 1
+
+        source.frame = np.full((90, 160, 3), 255, dtype=np.uint8)
+        started = time.monotonic()
+        second, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "ocr.frame"
+            and message["frame_id"] != first["frame_id"],
+            timeout=3.0,
+        )
+        assert time.monotonic() - started < 3.0
+        assert second["region"] == first["region"]
+
+        # A slide with no text must still emit a frame so the overlay clears.
+        engine.result = []
+        source.frame = np.full((90, 160, 3), 127, dtype=np.uint8)
+        blank, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "ocr.frame"
+            and message["frame_id"] > second["frame_id"],
+            timeout=3.0,
+        )
+        assert blank["blocks"] == []
+
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "render.ack",
+                    "event_id": second["event_id"],
+                    "painted_ts_ms": second["ts_ms"] + 90,
+                }
+            )
+        )
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+        )
+
+    session_dir = next((tmp_path / "data" / "sessions").iterdir())
+    slides = [
+        json.loads(line)
+        for line in (session_dir / "slides.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(slides) >= 2
+    assert slides[0]["blocks"][0]["text"] == "Slide heading"
+
+    with (session_dir / "metrics.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    ocr_rows = [row for row in rows if row["kind"] == "ocr"]
+    assert ocr_rows, "the render.ack did not produce an OCR latency row"
+    assert ocr_rows[-1]["painted_ts_ms"] == str(second["ts_ms"] + 90)
+
+
+class SlowWarmupOcrEngine(FakeOcrEngine):
+    """Model load takes 2 s; the session must reach running before it ends."""
+
+    def warmup(self) -> None:
+        time.sleep(2.0)
+
+
+def test_start_does_not_wait_for_ocr_warmup(tmp_path: Path) -> None:
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={
+            "screen": base.screen.model_copy(update={"enabled": True}),
+            "ocr": base.ocr.model_copy(update={"enabled": True}),
+        }
+    )
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource([]),
+            asr_client=FakeAsrClient(),
+            translator=FakeTranslator(),
+            segmenter_factory=FakeSegmenter,
+            screen_source=FakeScreenSource(np.zeros((90, 160, 3), dtype=np.uint8)),
+            ocr_engine=SlowWarmupOcrEngine(),
+            change_detector=SlideChangeDetector(config.screen),
+        )
+
+    app = create_app(config, ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        started = time.monotonic()
+        ws.send_text(
+            json.dumps(
+                {"type": "session.start", "source_lang": "en", "target_lang": "id"}
+            )
+        )
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "running",
+            timeout=2.0,
+        )
+        assert time.monotonic() - started < 1.0
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
+            timeout=6.0,
+        )
+
+
+def test_region_update_resets_slide_detector(tmp_path: Path) -> None:
+    """A same-size region move must OCR even when the frame pixels match."""
+
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={
+            "screen": base.screen.model_copy(
+                update={"enabled": True, "capture_interval_ms": 100}
+            ),
+            "ocr": base.ocr.model_copy(update={"enabled": True}),
+        }
+    )
+    source = FakeScreenSource(np.zeros((90, 160, 3), dtype=np.uint8))
+    engine = FakeOcrEngine()
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource([]),
+            asr_client=FakeAsrClient(),
+            translator=FakeTranslator(),
+            segmenter_factory=FakeSegmenter,
+            screen_source=source,
+            ocr_engine=engine,
+            change_detector=SlideChangeDetector(config.screen),
+        )
+
+    app = create_app(config, ports_factory=factory)
+    first_region = {"left": 0, "top": 0, "width": 160, "height": 90, "monitor": 1}
+    second_region = {"left": 300, "top": 100, "width": 160, "height": 90, "monitor": 1}
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "source_lang": "en",
+                    "target_lang": "id",
+                    "region": first_region,
+                }
+            )
+        )
+        first, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "ocr.frame",
+            timeout=5.0,
+        )
+
+        ws.send_text(
+            json.dumps({"type": "region.update", "region": second_region})
+        )
+        second, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "ocr.frame"
+            and message["frame_id"] > first["frame_id"],
+            timeout=3.0,
+        )
+        assert second["region"]["left"] == 300
+        assert second["region"]["top"] == 100
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "session.state"
+            and message["state"] == "stopped",
         )

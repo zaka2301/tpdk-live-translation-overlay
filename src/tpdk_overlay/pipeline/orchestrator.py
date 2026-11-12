@@ -23,13 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import queue
 import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from itertools import count
 from typing import Any
 
@@ -39,7 +39,6 @@ from tpdk_overlay.asr.errors import AsrTimeout, AsrUnavailable
 from tpdk_overlay.audio.vad import VAD_FRAME_MS, VAD_FRAME_SAMPLES, SpeechStart, Utterance
 from tpdk_overlay.config import AppConfig
 from tpdk_overlay.contracts import (
-    BBox,
     NoticeEvent,
     NoticeLevel,
     OcrBlock,
@@ -56,6 +55,7 @@ from tpdk_overlay.contracts import (
     TranslationStatus,
 )
 from tpdk_overlay.mt.languages import to_nllb
+from tpdk_overlay.ocr.grouping import block_id, group_lines
 from tpdk_overlay.pipeline.events import EventBus
 from tpdk_overlay.pipeline.metrics import MetricsRecorder
 from tpdk_overlay.pipeline.session import SessionClock, SessionStore
@@ -104,8 +104,8 @@ _LOG_LEVEL = {
 class PipelinePorts:
     """Adapters behind the orchestrator seams.
 
-    ``screen_source``/``ocr_engine``/``summarizer`` are optional so phase 3 runs
-    transcript-only; later phases supply the real adapters. A supplied
+    ``screen_source``/``ocr_engine``/``summarizer`` are optional so a session can
+    run transcript-only (tests, missing ML extras, or OCR disabled). A supplied
     ``segmenter_factory`` replaces Silero (integration tests use it).
     """
 
@@ -166,12 +166,17 @@ class _TranslationJob:
 
 
 def build_default_ports(
-    config: AppConfig, *, translator: Translator | None = None
+    config: AppConfig,
+    *,
+    translator: Translator | None = None,
+    ocr_engine: OcrEngine | None = None,
 ) -> PipelinePorts:
-    """Build the production adapters; screen/OCR/summarizer appear in later phases.
+    """Build the production adapters.
 
-    The optional imports are guarded so the phase 3 backend runs transcript-only
-    until the phase 5/6 modules land, without a speculative import error.
+    Screen/OCR and the summarizer are still imported behind guards so a machine
+    without the optional ML extras runs transcript-only instead of failing to
+    start. ``translator``/``ocr_engine`` let the backend reuse process-wide
+    models across sessions.
     """
 
     from tpdk_overlay.asr import create_asr_client
@@ -180,7 +185,7 @@ def build_default_ports(
 
     screen_source: ScreenSource | None = None
     change_detector: Any | None = None
-    ocr_engine: OcrEngine | None = None
+    block_grouper: BlockGrouper | None = None
     if config.screen.enabled and config.ocr.enabled:
         try:
             from tpdk_overlay.ocr.paddle import PaddleOcrEngine
@@ -191,7 +196,13 @@ def build_default_ports(
         else:
             screen_source = MssScreenSource(config.screen)
             change_detector = SlideChangeDetector(config.screen)
-            ocr_engine = PaddleOcrEngine(config.ocr)
+            if ocr_engine is None:
+                ocr_engine = PaddleOcrEngine(config.ocr)
+            block_grouper = partial(
+                group_lines,
+                gap_px=config.ocr.block_gap_px,
+                max_blocks=config.ocr.max_blocks,
+            )
 
     summarizer: Summarizer | None = None
     if config.summary.enabled and config.summary.api_key():
@@ -209,13 +220,9 @@ def build_default_ports(
         screen_source=screen_source,
         ocr_engine=ocr_engine,
         change_detector=change_detector,
+        block_grouper=block_grouper,
         summarizer=summarizer,
     )
-
-
-def _block_id(bbox: BBox, text: str) -> str:
-    payload = f"{bbox.x}:{bbox.y}:{bbox.w}:{bbox.h}:{text}".encode()
-    return hashlib.blake2s(payload, digest_size=8).hexdigest()
 
 
 class Orchestrator:
@@ -499,6 +506,13 @@ class Orchestrator:
         self._region_override = region
         if self._settings is not None:
             self._settings.region = region
+        # The next capture is a different part of the screen even if it has the
+        # same pixel size; do not diff it against the old region's thumbnail.
+        ports = self._ports
+        if ports is not None:
+            reset = getattr(ports.change_detector, "reset", None)
+            if callable(reset):
+                reset()
 
     def set_overlay_visibility(self, target: str, visible: bool) -> None:
         """Remember the UI's local caption/OCR visibility toggle."""
@@ -559,14 +573,21 @@ class Orchestrator:
             translator_warmup = getattr(ports.translator, "warmup", None)
             if callable(translator_warmup):
                 threading.Thread(
-                    target=self._warm_translator,
-                    args=(translator_warmup,),
+                    target=self._warm_adapter,
+                    args=("translator", translator_warmup),
                     name="tpdk-mt-warm",
                     daemon=True,
                 ).start()
+            # OCR loading takes ~18 s on CPU; the OCR thread waits on the
+            # engine lock, so capture/transcript start without waiting for it.
             ocr_warmup = getattr(ports.ocr_engine, "warmup", None)
             if callable(ocr_warmup):
-                await asyncio.to_thread(ocr_warmup)
+                threading.Thread(
+                    target=self._warm_adapter,
+                    args=("OCR", ocr_warmup),
+                    name="tpdk-ocr-warm",
+                    daemon=True,
+                ).start()
             if self._stop_event.is_set():
                 return
 
@@ -605,11 +626,11 @@ class Orchestrator:
             self._notice(NoticeLevel.ERROR, "session_start_failed", str(exc))
 
     @staticmethod
-    def _warm_translator(warmup: Any) -> None:
+    def _warm_adapter(name: str, warmup: Any) -> None:
         try:
             warmup()
-        except Exception as exc:  # noqa: BLE001 - the MT worker reports real errors
-            logger.warning("translator warmup failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - the worker reports real errors
+            logger.warning("%s warmup failed: %s", name, exc, exc_info=True)
 
     def _default_segmenter_factory(self) -> SegmenterFactory:
         def build() -> Any:
@@ -1295,36 +1316,42 @@ class Orchestrator:
         lines = [
             line for line in lines if line.confidence >= self._config.ocr.min_confidence
         ][: self._config.ocr.max_blocks]
-        if not lines:
-            return
 
-        blocks = self._group_blocks(lines, ports)
+        blocks: tuple[OcrBlock, ...] = ()
         mt_ms: int | None = None
-        stopwatch = Stopwatch()
-        try:
-            translations = ports.translator.translate(
-                [block.text for block in blocks],
-                source_lang=self._settings.source_lang,
-                target_lang=self._settings.target_lang,
-            )
-            mt_ms = stopwatch.elapsed_ms()
-            blocks = tuple(
-                block.model_copy(
-                    update={
-                        "translation": translation,
-                        "translation_status": TranslationStatus.OK,
-                    }
+        if lines:
+            blocks = self._group_blocks(lines, ports)
+            stopwatch = Stopwatch()
+            try:
+                translations = ports.translator.translate(
+                    [block.text for block in blocks],
+                    source_lang=self._settings.source_lang,
+                    target_lang=self._settings.target_lang,
                 )
-                for block, translation in zip(blocks, translations, strict=True)
-            )
-        except Exception as exc:  # noqa: BLE001 - keep the source blocks visible
-            mt_ms = stopwatch.elapsed_ms()
-            logger.warning("OCR block translation failed: %s", exc)
-            self._notice(NoticeLevel.WARNING, "mt_unavailable", f"OCR translation failed: {exc}")
-            blocks = tuple(
-                block.model_copy(update={"translation_status": TranslationStatus.FAILED})
-                for block in blocks
-            )
+                mt_ms = stopwatch.elapsed_ms()
+                blocks = tuple(
+                    block.model_copy(
+                        update={
+                            "translation": translation,
+                            "translation_status": TranslationStatus.OK,
+                        }
+                    )
+                    for block, translation in zip(blocks, translations, strict=True)
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the source blocks visible
+                mt_ms = stopwatch.elapsed_ms()
+                logger.warning("OCR block translation failed: %s", exc)
+                self._notice(
+                    NoticeLevel.WARNING,
+                    "mt_unavailable",
+                    f"OCR translation failed: {exc}",
+                )
+                blocks = tuple(
+                    block.model_copy(
+                        update={"translation_status": TranslationStatus.FAILED}
+                    )
+                    for block in blocks
+                )
 
         event = OcrFrameEvent(
             session_id=self.session_id,
@@ -1337,7 +1364,9 @@ class Orchestrator:
             change_ts_ms=change_ts_ms,
         )
         self._publish(event)
-        if self._metrics is not None:
+        # An empty frame carries no paintable content; it exists so the UI
+        # clears boxes left over from the previous slide.
+        if self._metrics is not None and blocks:
             self._metrics.note(event)
         if self._session is not None:
             self._session.append_slide(event)
@@ -1358,7 +1387,7 @@ class Orchestrator:
         else:
             blocks = tuple(
                 OcrBlock(
-                    block_id=_block_id(line.bbox, line.text),
+                    block_id=block_id(line.bbox, line.text),
                     bbox=line.bbox,
                     text=line.text,
                     confidence=line.confidence,

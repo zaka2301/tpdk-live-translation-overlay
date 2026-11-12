@@ -53,6 +53,7 @@ from tpdk_overlay.contracts import (
 from tpdk_overlay.mt.languages import supported_languages
 from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
 from tpdk_overlay.ui.client import OverlayClient
+from tpdk_overlay.ui.ocr_overlay import OcrOverlayWindow
 from tpdk_overlay.utils.clock import now_ms
 from tpdk_overlay.utils.logging import setup_logging
 
@@ -246,6 +247,15 @@ class OverlayApp(QObject):
         self._caption.set_region(self._region)
         self._history = HistoryWindow(config.ui)
         self._history.hide()
+        self._ocr = (
+            OcrOverlayWindow(
+                config.ui.ocr_overlay, click_through=self._click_through
+            )
+            if config.ui.ocr_overlay.enabled
+            and config.screen.enabled
+            and config.ocr.enabled
+            else None
+        )
 
         self._client = OverlayClient(
             f"ws://{config.server.host}:{config.server.port}/ws", parent=self
@@ -253,6 +263,7 @@ class OverlayApp(QObject):
         self._hotkey = GlobalHotkey(parent=self)
         self._hotkey.triggered.connect(self._toggle_click_through)
         self._tray: QSystemTrayIcon | None = None
+        self._action_ocr: QAction | None = None
         self._tray = self._build_tray()
         self._update_actions()
 
@@ -294,6 +305,8 @@ class OverlayApp(QObject):
             self._tray.hide()
         self._caption.close()
         self._history.close()
+        if self._ocr is not None:
+            self._ocr.close()
 
     def _stop_session_for_exit(self) -> None:
         """Ask the backend to stop and give it a bounded moment to persist."""
@@ -413,14 +426,35 @@ class OverlayApp(QObject):
                     "transcription continues",
                 )
         elif isinstance(event, OcrFrameEvent):
-            # The OCR overlay lands in phase 5; no render ack until it paints.
-            pass
+            self._on_ocr_frame(event)
+
+    def _on_ocr_frame(self, event: OcrFrameEvent) -> None:
+        """Paint translated slide blocks and report NFR-03's paint time."""
+
+        if self._ocr is None:
+            return
+        self._ocr.show_frame(event)
+        self._update_actions()
+        if not self._ocr.has_content() or not self._ocr.isVisible():
+            return
+        self._ocr.paint_now()
+        self._send(
+            RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
+        )
 
     def _on_session_state(self, event: SessionStateEvent) -> None:
         self._state = event.state
         if event.session_id and event.session_id != self._session_id:
             self._session_id = event.session_id
             self._history.set_session(event.session_id)
+        if event.state in (
+            SessionState.IDLE,
+            SessionState.STOPPED,
+            SessionState.ERROR,
+        ):
+            ocr = getattr(self, "_ocr", None)
+            if ocr is not None:
+                ocr.clear()
         self._caption.set_session_state(event.state)
         self._update_actions()
         self._maybe_auto_start(event.state)
@@ -469,9 +503,18 @@ class OverlayApp(QObject):
         if self._client.is_connected:
             self._send(OverlayToggleCommand(target="caption", visible=visible))
 
+    def _set_ocr_visible(self, visible: bool) -> None:
+        if self._ocr is not None:
+            self._ocr.set_overlay_visible(visible)
+        self._update_actions()
+        if self._client.is_connected:
+            self._send(OverlayToggleCommand(target="ocr", visible=visible))
+
     def _set_click_through(self, enabled: bool) -> None:
         self._click_through = bool(enabled)
         self._caption.set_click_through(self._click_through)
+        if self._ocr is not None:
+            self._ocr.set_click_through(self._click_through)
         if self._tray is not None:
             with QSignalBlocker(self._action_click_through):
                 self._action_click_through.setChecked(self._click_through)
@@ -497,6 +540,8 @@ class OverlayApp(QObject):
         self._picker = None
         self._region = region
         self._caption.set_region(region)
+        if self._ocr is not None:
+            self._ocr.set_region(region)
         self._send(RegionUpdateCommand(region=region))
 
     def _on_region_cancelled(self) -> None:
@@ -518,6 +563,14 @@ class OverlayApp(QObject):
         self._action_visible.setChecked(True)
         self._action_visible.toggled.connect(self._set_caption_visible)
         menu.addAction(self._action_visible)
+
+        self._action_ocr = None
+        if self._ocr is not None:
+            self._action_ocr = QAction("Slide translations visible", menu)
+            self._action_ocr.setCheckable(True)
+            self._action_ocr.setChecked(True)
+            self._action_ocr.toggled.connect(self._set_ocr_visible)
+            menu.addAction(self._action_ocr)
 
         self._action_click_through = QAction(
             f"Click-through ({HOTKEY_LABEL})", menu
@@ -573,6 +626,11 @@ class OverlayApp(QObject):
         )
         with QSignalBlocker(self._action_visible):
             self._action_visible.setChecked(self._caption.isVisible())
+        if self._action_ocr is not None:
+            with QSignalBlocker(self._action_ocr):
+                self._action_ocr.setChecked(
+                    self._ocr is not None and self._ocr.isVisible()
+                )
 
 
 # --------------------------------------------------------------------------- #
