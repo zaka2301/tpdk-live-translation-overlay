@@ -30,7 +30,14 @@ from tpdk_overlay.contracts import (
     TranslationStatus,
 )
 from tpdk_overlay.mt.languages import supported_languages
-from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
+from tpdk_overlay.ui.caption import (
+    CaptionLabel,
+    CaptionWindow,
+    HistoryWindow,
+    RegionPicker,
+    _changed_ranges,
+    _marked_html,
+)
 from tpdk_overlay.ui.client import Backoff, OverlayClient
 
 
@@ -224,6 +231,193 @@ def test_caption_language_menu_matches_provider(qt_app: QApplication) -> None:
         window.close()
     assert {"en", "id", "zh-hans", "zh-hant", "tl"} <= codes
     assert {"pt", "el", "tr", "yue"}.isdisjoint(codes)
+
+
+def test_changed_ranges_marks_new_words() -> None:
+    new = "the derivative measures how the output changes"
+    ranges = _changed_ranges("the derivative measures", new)
+    marked = "".join(new[start:end] for start, end in ranges)
+    assert "how" in marked and "output" in marked
+    assert "derivative" not in marked
+
+
+def test_marked_html_escapes_and_highlights() -> None:
+    marked = _marked_html("a < b", [(2, 3)], "#7ee787")
+    assert "&lt;" in marked
+    assert "<span" in marked and "color: #7ee787" in marked
+
+
+def test_caption_marks_new_source_preview(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(revision=1, status=SegmentStatus.PARTIAL, text="the derivative")
+        )
+        assert "<span" not in window._source_label.text()
+        window.show_segment(
+            _segment(
+                revision=2,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative measures change",
+            )
+        )
+        assert "<span" in window._source_label.text()
+        assert "measures change" in window.current_text()[0]
+        window.show_segment(
+            _segment(
+                revision=3,
+                status=SegmentStatus.FINAL,
+                text="the derivative measures change",
+            )
+        )
+        assert "<span" not in window._source_label.text()
+        assert "<span" not in window._translation_label.text()
+    finally:
+        window.close()
+
+
+def test_caption_marks_final_corrections(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(
+                revision=1,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative measures",
+                translation="turunan mengukur",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        window.show_segment(
+            _segment(
+                revision=2,
+                status=SegmentStatus.FINAL,
+                text="the derivative measures change",
+            )
+        )
+        assert "<span" in window._source_label.text()
+        assert "change" in window._source_label.text()
+        assert "<span" not in window._translation_label.text()
+
+        window.show_segment(
+            _segment(
+                revision=3,
+                status=SegmentStatus.FINAL,
+                text="the derivative measures change",
+                translation="turunan mengukur perubahan",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        assert "<span" in window._source_label.text()
+        assert "<span" in window._translation_label.text()
+        assert "perubahan" in window._translation_label.text()
+        assert window.current_text() == (
+            "the derivative measures change",
+            "turunan mengukur perubahan",
+        )
+    finally:
+        window.close()
+
+
+def test_caption_does_not_mark_first_final_translation(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(
+                revision=1,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative measures",
+            )
+        )
+        window.show_segment(
+            _segment(
+                revision=2,
+                status=SegmentStatus.FINAL,
+                text="the derivative measures",
+                translation="turunan mengukur",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        assert "<span" not in window._source_label.text()
+        assert "<span" not in window._translation_label.text()
+    finally:
+        window.close()
+
+
+def test_caption_marks_new_translation_preview(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(
+                revision=1,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative",
+                translation="turunan",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        assert "<span" not in window._translation_label.text()
+        window.show_segment(
+            _segment(
+                revision=2,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative measures change",
+            )
+        )
+        assert "<span" in window._source_label.text()
+        window.show_segment(
+            _segment(
+                revision=2,
+                status=SegmentStatus.PARTIAL,
+                text="the derivative measures change",
+                translation="turunan mengukur perubahan",
+                translation_status=TranslationStatus.OK,
+            )
+        )
+        assert "<span" in window._source_label.text()
+        assert "<span" in window._translation_label.text()
+        assert "mengukur" in window._translation_label.text()
+        assert window.current_text()[1] == "turunan mengukur perubahan"
+    finally:
+        window.close()
+
+
+def test_caption_text_is_painted_with_shadow(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(), source_lang="en", target_lang="id", checkpoint_interval_s=300
+    )
+    try:
+        window.show_segment(
+            _segment(revision=1, status=SegmentStatus.PARTIAL, text="shadow")
+        )
+        window.show()
+        qt_app.processEvents()
+        assert isinstance(window._source_label, CaptionLabel)
+        assert isinstance(window._translation_label, CaptionLabel)
+
+        image = window._source_label.grab().toImage()
+        dark = 0
+        for y in range(image.height()):
+            for x in range(image.width()):
+                color = image.pixelColor(x, y)
+                if (
+                    color.alpha() > 0
+                    and color.red() < 120
+                    and color.green() < 120
+                    and color.blue() < 120
+                ):
+                    dark += 1
+        assert dark > 0, "the painted text has no shadow pixels"
+    finally:
+        window.close()
 
 
 def test_caption_enriches_partial_with_same_revision_translation(

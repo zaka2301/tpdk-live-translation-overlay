@@ -107,15 +107,15 @@ ui:
     width: 1200
     height: 300           # fits ~3-4 translation lines at the default font
     anchor: bottom-center
-    opacity: 0.50
+    opacity: 0.65
     font_family: Segoe UI
-    font_size: 15
-    translation_font_size: 15
+    font_size: 18
+    translation_font_size: 18
     final_hold_ms: 3500     # minimum reading time for a translated final
   ocr_overlay:
     enabled: true
     background: "#101418"
     opacity: 0.40
     font_family: Segoe UI
-    font_size: 14
+    font_size: 18
   click_through: true

@@ -61,7 +61,7 @@ class VadConfig(_Section):
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     min_speech_ms: int = Field(default=250, ge=0)
     min_silence_ms: int = Field(default=450, ge=0)
-    max_utterance_ms: int = Field(default=10_000, gt=0)
+    max_utterance_ms: int = Field(default=12_000, gt=0)
     pre_roll_ms: int = Field(default=300, ge=0)
 
 
@@ -78,7 +78,7 @@ class LlamaCppAsrConfig(_Section):
 
     base_url: str = "http://127.0.0.1:8081"
     max_new_tokens: int = Field(default=128, gt=0)
-    partial_interval_ms: int = Field(default=2000, gt=0)
+    partial_interval_ms: int = Field(default=3000, gt=0)
     partial_tail_sec: float = Field(default=0.0, ge=0.0)
     min_energy_dbfs: float = -40.0
     system_prompt: str = ""

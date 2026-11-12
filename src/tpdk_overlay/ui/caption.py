@@ -14,8 +14,10 @@ phase 5 capture adapter can use it directly.
 
 from __future__ import annotations
 
+import difflib
 import html
 import logging
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,6 +34,9 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QTextCharFormat,
+    QTextCursor,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QComboBox,
@@ -65,6 +70,107 @@ MIN_HEIGHT = 150
 PANEL_RADIUS = 16.0
 GRIP_SIZE = 18
 SCREEN_MARGIN = 48
+
+_WORD_RE = re.compile(r"\S+")
+
+
+def _changed_ranges(old: str, new: str) -> list[tuple[int, int]]:
+    """Character ranges in ``new`` that are not present in ``old``.
+
+    Word-level diffs keep the highlight on whole words instead of marking a
+    changed suffix inside a word. The first preview (no ``old``) is clean.
+    """
+
+    if not old or not new or old == new:
+        return []
+    old_words = [match.group() for match in _WORD_RE.finditer(old)]
+    new_matches = list(_WORD_RE.finditer(new))
+    if not new_matches:
+        return []
+    matcher = difflib.SequenceMatcher(
+        None, old_words, [match.group() for match in new_matches], autojunk=False
+    )
+    ranges: list[tuple[int, int]] = []
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or j1 >= j2:
+            continue
+        start = new_matches[j1].start()
+        end = new_matches[j2 - 1].end()
+        if ranges and start <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], end)
+        else:
+            ranges.append((start, end))
+    return ranges
+
+
+def _escape_markup(text: str) -> str:
+    return html.escape(text).replace("\n", "<br/>")
+
+
+def _marked_html(text: str, ranges: Sequence[tuple[int, int]], color: str) -> str:
+    """Escape ``text`` for a QLabel and wrap ``ranges`` in colored spans."""
+
+    if not ranges:
+        return _escape_markup(text)
+    parts: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        start = max(cursor, min(start, len(text)))
+        end = min(max(end, start), len(text))
+        if end <= start:
+            continue
+        parts.append(_escape_markup(text[cursor:start]))
+        parts.append(
+            f'<span style="color: {color};">{_escape_markup(text[start:end])}</span>'
+        )
+        cursor = end
+    parts.append(_escape_markup(text[cursor:]))
+    return "".join(parts)
+
+
+class CaptionLabel(QLabel):
+    """QLabel painted through QTextDocument with a soft black text shadow.
+
+    QLabel has no text-shadow style, so the text is rendered here: one copy is
+    recoloured black at low alpha and drawn one pixel down-right, then the
+    normal rich-text copy is drawn on top. The shadow keeps the green preview
+    spans readable without closing glyph counters the way a full outline does.
+    """
+
+    def paintEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
+        text = self.text()
+        width = self.contentsRect().width()
+        if not text or width <= 0:
+            return
+        color = self.palette().color(self.foregroundRole()).name()
+        if self.textFormat() is Qt.TextFormat.RichText:
+            body = f'<span style="color: {color};">{text}</span>'
+        else:
+            body = f'<span style="color: {color};">{_escape_markup(text)}</span>'
+
+        def document() -> QTextDocument:
+            built = QTextDocument(self)
+            built.setDocumentMargin(0)
+            built.setDefaultFont(self.font())
+            built.setHtml(body)
+            built.setTextWidth(width)
+            return built
+
+        shadow = document()
+        cursor = QTextCursor(shadow)
+        cursor.select(QTextCursor.SelectionType.Document)
+        shade = QTextCharFormat()
+        shade.setForeground(QColor(0, 0, 0, 170))
+        cursor.mergeCharFormat(shade)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.contentsRect().topLeft())
+        painter.translate(1, 1)
+        shadow.drawContents(painter)
+        painter.translate(-1, -1)
+        document().drawContents(painter)
+        painter.end()
 
 LANGUAGE_NAMES: dict[str, str] = {
     "ar": "Arabic",
@@ -234,6 +340,12 @@ class CaptionWindow(QWidget):
         self._full_translation = ""
         self._segment_final = False
         self._revisions: dict[int, int] = {}
+        self._mark_segment_id: int | None = None
+        self._shown_source_plain = ""
+        self._shown_translation_plain = ""
+        self._last_translation_plain = ""
+        self._source_mark_ranges: list[tuple[int, int]] = []
+        self._translation_mark_ranges: list[tuple[int, int]] = []
         self._pending: TranscriptSegmentEvent | None = None
         self._final_hold_ms = int(ui.caption.final_hold_ms)
         self._hold_until = 0.0
@@ -322,7 +434,7 @@ class CaptionWindow(QWidget):
         row.addStretch(1)
         layout.addWidget(self._controls)
 
-        self._source_label = QLabel("", self)
+        self._source_label = CaptionLabel("", self)
         self._source_label.setTextFormat(Qt.TextFormat.PlainText)
         self._source_label.setWordWrap(True)
         self._source_label.setAlignment(
@@ -338,7 +450,7 @@ class CaptionWindow(QWidget):
         )
         layout.addWidget(self._source_label)
 
-        self._translation_label = QLabel("", self)
+        self._translation_label = CaptionLabel("", self)
         self._translation_label.setTextFormat(Qt.TextFormat.PlainText)
         self._translation_label.setWordWrap(True)
         self._translation_label.setAlignment(
@@ -377,7 +489,7 @@ class CaptionWindow(QWidget):
     def current_text(self) -> tuple[str, str]:
         """Currently displayed (source, translation); used by smoke tests."""
 
-        return self._source_label.text(), self._translation_label.text()
+        return self._shown_source_plain, self._shown_translation_plain
 
     def set_source_language(self, code: str) -> None:
         self._select_language(self._source_combo, code)
@@ -482,13 +594,26 @@ class CaptionWindow(QWidget):
         """Render the event immediately; a translated final starts a hold."""
 
         final = event.status is SegmentStatus.FINAL
+        if self._mark_segment_id != event.segment_id:
+            self._mark_segment_id = event.segment_id
+            self._shown_source_plain = ""
+            self._shown_translation_plain = ""
+            self._last_translation_plain = ""
+            self._source_mark_ranges = []
+            self._translation_mark_ranges = []
         self._segment_final = final
         source_font = self._source_label.font()
         source_font.setItalic(not final)
         self._source_label.setFont(source_font)
         self._full_source = event.text
         self._full_translation = self._translation_text(event)
-        self._apply_fitted_text()
+        has_translation = bool(event.translation)
+        self._apply_fitted_text(
+            mark=True,
+            keep_source=has_translation,
+            mark_translation=has_translation,
+            remember_translation=has_translation,
+        )
         self._translation_label.setStyleSheet(
             f"color: {self._translation_color(event)};"
         )
@@ -564,12 +689,27 @@ class CaptionWindow(QWidget):
         self._refresh_status()
         QTimer.singleShot(8500, self._refresh_status)
 
-    def _apply_fitted_text(self) -> None:
-        """Show as much as fits; the full text still lives in history."""
+    def _apply_fitted_text(
+        self,
+        *,
+        mark: bool | None = None,
+        keep_source: bool = False,
+        mark_translation: bool = True,
+        remember_translation: bool = True,
+    ) -> None:
+        """Show as much as fits; the full text still lives in history.
+
+        ``mark=True`` highlights words that differ from the previous preview or
+        final; ``mark=None`` re-applies the last highlight after a resize when
+        the fitted text is unchanged. ``keep_source`` preserves the source
+        highlight when a translation for the same source text arrives.
+        ``mark_translation`` and ``remember_translation`` keep the
+        ``translating...`` placeholder out of the diff baseline.
+        """
 
         if self.layout() is not None:
             self.layout().activate()
-        self._fit_text(
+        shown_source = self._fit_text(
             self._source_label,
             self._full_source,
             keep_tail=not self._segment_final,
@@ -580,12 +720,53 @@ class CaptionWindow(QWidget):
         if self.layout() is not None:
             self.layout().invalidate()
             self.layout().activate()
-        self._fit_text(
+        shown_translation = self._fit_text(
             self._translation_label,
             self._full_translation,
             keep_tail=not self._segment_final,
             max_height=max(0, self._translation_label.height() - 4),
         )
+
+        if mark is True:
+            if keep_source:
+                if shown_source != self._shown_source_plain:
+                    self._source_mark_ranges = _changed_ranges(
+                        self._shown_source_plain, shown_source
+                    )
+            else:
+                self._source_mark_ranges = _changed_ranges(
+                    self._shown_source_plain, shown_source
+                )
+            self._translation_mark_ranges = (
+                _changed_ranges(self._last_translation_plain, shown_translation)
+                if mark_translation and shown_translation
+                else []
+            )
+        else:
+            if shown_source != self._shown_source_plain:
+                self._source_mark_ranges = []
+            if shown_translation != self._shown_translation_plain:
+                self._translation_mark_ranges = []
+
+        self._render_label(self._source_label, shown_source, self._source_mark_ranges)
+        self._render_label(
+            self._translation_label, shown_translation, self._translation_mark_ranges
+        )
+        self._shown_source_plain = shown_source
+        self._shown_translation_plain = shown_translation
+        if mark is True and remember_translation and shown_translation:
+            self._last_translation_plain = shown_translation
+
+    @staticmethod
+    def _render_label(
+        label: QLabel, text: str, ranges: Sequence[tuple[int, int]]
+    ) -> None:
+        if ranges:
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(_marked_html(text, ranges, theme.PREVIEW_ADDED))
+        else:
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setText(text)
 
     @staticmethod
     def _fit_text(
@@ -594,15 +775,16 @@ class CaptionWindow(QWidget):
         *,
         keep_tail: bool,
         max_height: int,
-    ) -> None:
+    ) -> str:
+        label.setTextFormat(Qt.TextFormat.PlainText)
         if not text:
             label.clear()
-            return
+            return ""
         width = label.width()
         height = max_height if 0 < max_height < 10_000 else label.height()
         if width <= 0 or height <= 0:
             label.setText(text)
-            return
+            return text
 
         metrics = QFontMetrics(label.font())
         flags = Qt.TextFlag.TextWordWrap
@@ -614,7 +796,7 @@ class CaptionWindow(QWidget):
 
         if measure(text) <= height:
             label.setText(text)
-            return
+            return text
 
         words = text.split()
         prefix = "… " if keep_tail else ""
@@ -630,9 +812,11 @@ class CaptionWindow(QWidget):
                 high = middle - 1
         if low <= 0:
             label.setText("…")
-            return
+            return "…"
         subset = words[-low:] if keep_tail else words[:low]
-        label.setText(prefix + " ".join(subset) + suffix)
+        shown = prefix + " ".join(subset) + suffix
+        label.setText(shown)
+        return shown
 
     def paint_now(self) -> None:
         """Force an immediate paint so a render ack carries a real timestamp."""

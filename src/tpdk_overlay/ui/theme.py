@@ -15,11 +15,12 @@ from PySide6.QtGui import QColor, QFont
 # translucent video.
 BACKGROUND = "#0b1017"
 BORDER = "#2c3d4f"
-SOURCE_TEXT = "#a9bccd"
+SOURCE_TEXT = "#c6d5e3"
 TRANSLATION_TEXT = "#f3f8fd"
 STATUS_TEXT = "#8497a9"
 ACCENT = "#4cc2ff"
 ACCENT_HOVER = "#6fd0ff"
+PREVIEW_ADDED = "#7ee787"
 WARNING = "#ffb454"
 ERROR = "#ff6b6b"
 
