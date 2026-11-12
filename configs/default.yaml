@@ -1,0 +1,96 @@
+# Runtime configuration. Schema: src/tpdk_overlay/config.py.
+# Any key can be overridden by an environment variable TPDK__<SECTION>__<KEY>,
+# e.g. TPDK__SERVER__PORT=9000 or TPDK__OCR__ENABLED=false.
+
+app:
+  data_dir: data
+  log_level: INFO
+  language:
+    source: en      # ISO 639-1; Indonesian "id", English "en"
+    target: id
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+audio:
+  source: loopback        # loopback (system audio) | microphone
+  input_device: null      # null = default output device for loopback, default mic otherwise
+  sample_rate: 48000      # device capture rate; resampled to 16 kHz for ASR
+  block_ms: 30
+  vad:
+    engine: silero
+    threshold: 0.5
+    min_speech_ms: 250
+    min_silence_ms: 450
+    max_utterance_ms: 20000
+    pre_roll_ms: 300
+
+asr:
+  backend: http                # http = vLLM service in WSL; native = transformers on Windows (backup)
+  base_url: http://127.0.0.1:8000
+  model: Qwen/Qwen3-ASR-0.6B   # informational; the service decides which weights are loaded
+  language: null               # null = auto-detect; "English"/"Indonesian" sent to /api/start?language=
+  chunk_size_sec: 1.0          # vLLM streaming chunk; lower = faster partials, weaker accuracy
+  unfixed_chunk_num: 4
+  unfixed_token_num: 5
+  timeout_s: 30
+  native:                      # used only when backend: native
+    model: Qwen/Qwen3-ASR-0.6B
+    device: auto               # auto | cuda | cpu
+    dtype: float16             # float16 | bfloat16 | float32 (float32 on CPU)
+    max_inference_batch_size: 1
+    max_new_tokens: 256
+
+mt:
+  model: facebook/nllb-200-distilled-600M
+  device: cuda
+  dtype: float16
+  max_input_tokens: 512
+  max_new_tokens: 256
+  batch_size: 8
+
+screen:
+  enabled: true
+  monitor: 1
+  region: null            # {left, top, width, height} in physical pixels; null = pick in the UI
+  capture_interval_ms: 1000
+  change_threshold: 0.02  # fraction of pixels that must change to trigger OCR
+
+ocr:
+  enabled: true
+  device: cpu             # keep OCR on CPU to respect the 4 GB GPU budget
+  det_model: PP-OCRv6_small_det
+  rec_model: PP-OCRv6_small_rec
+  min_confidence: 0.5
+  max_blocks: 80
+  block_gap_px: 18
+  resize_max_side: 1280
+
+summary:
+  enabled: true
+  provider: gemini
+  model: gemini-3.5-flash-lite
+  checkpoint_interval_s: 300
+  api_key_env: GEMINI_API_KEY
+  max_output_tokens: 2048
+  temperature: 0.2
+  timeout_s: 60
+  min_request_interval_s: 4.5
+
+ui:
+  caption:
+    width: 1100
+    height: 220
+    anchor: bottom-center
+    opacity: 0.85
+    font_family: Segoe UI
+    font_size: 20
+    translation_font_size: 22
+  ocr_overlay:
+    enabled: true
+    background: "#101418"
+    opacity: 0.92
+    font_family: Segoe UI
+    font_size: 14
+  click_through: true

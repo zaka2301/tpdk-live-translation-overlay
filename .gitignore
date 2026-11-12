@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+*.log
+
+# Session artifacts stay local; only the placeholder files are tracked.
+data/logs/*
+!data/logs/.gitkeep
+data/sessions/*
+!data/sessions/.gitkeep
