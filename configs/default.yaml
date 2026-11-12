@@ -83,7 +83,8 @@ screen:
 
 ocr:
   enabled: true
-  device: cpu             # keep OCR on CPU to respect the 4 GB GPU budget
+  device: gpu             # GPU small: ~0.4 s p50, ~0.7 GB peak; CPU fallback automatic
+  enable_mkldnn: false    # oneDNN crashes on Paddle 3.3.x + PP-OCRv6 CPU; GPU ignores it
   det_model: PP-OCRv6_small_det
   rec_model: PP-OCRv6_small_rec
   min_confidence: 0.5

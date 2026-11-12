@@ -34,9 +34,10 @@ ml = [
     "silero-vad>=5.1",
 ]
 ocr = [
-    "paddlepaddle==3.2.0",
     "paddleocr>=3.7",
 ]
+# Paddle itself is platform-specific: install paddlepaddle-gpu (CUDA) with
+# scripts/setup_paddle_gpu.ps1, or paddlepaddle (CPU) manually.
 # Optional quantized MT path (mt.provider: nllb_ct2). CTranslate2 does not need
 # torch, but the NLLB tokenizer still comes from transformers + sentencepiece.
 ct2 = [

@@ -18,5 +18,8 @@ Write-Host "Installing CUDA 13.0 torch (must be installed before the ml extra)..
 Write-Host "Installing project extras (ui, ml, ocr, summarize, ct2, dev)..."
 & uv pip install --python $py -e ".[ui,ml,ocr,summarize,ct2,dev]"
 
+Write-Host "Installing PaddlePaddle GPU (CUDA 13) and the venv DLL hook..."
+& powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\setup_paddle_gpu.ps1"
+
 Write-Host "Checking environment..."
 & $py "scripts\check_env.py"

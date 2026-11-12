@@ -58,7 +58,19 @@ def _line(status: str, message: str) -> None:
     print(f"[{status:<4}] {message}")
 
 
+def _register_cuda_dlls() -> None:
+    """Load the CUDA/cuDNN DLL dirs before Paddle is imported on Windows."""
+
+    try:
+        from tpdk_overlay.ocr.paddle import register_cuda_dlls
+
+        register_cuda_dlls()
+    except Exception:  # noqa: BLE001 - reported by the import checks
+        pass
+
+
 def _check_imports() -> None:
+    _register_cuda_dlls()
     for name in CORE_MODULES:
         try:
             importlib.import_module(name)
@@ -142,6 +154,44 @@ def _check_torch(config: AppConfig | None) -> None:
             f"torch {torch.__version__} cuda=False "
             f"(not required for mt.provider={provider})",
         )
+
+
+def _check_ocr(config: AppConfig | None) -> None:
+    if config is None or not config.ocr.enabled:
+        if config is not None:
+            _line("OK", "OCR disabled")
+        return
+    try:
+        import paddle
+    except Exception as exc:  # noqa: BLE001 - reported by the import check
+        failures.append("paddle")
+        _line("FAIL", f"OCR runtime import failed: {exc}")
+        return
+
+    models = f"{config.ocr.det_model}/{config.ocr.rec_model}"
+    if config.ocr.device == "cpu":
+        _line("OK", f"OCR CPU: {models} (paddle {paddle.__version__})")
+        return
+    if not paddle.device.is_compiled_with_cuda():
+        failures.append("ocr-gpu")
+        _line(
+            "FAIL",
+            f"ocr.device=gpu but paddle {paddle.__version__} is a CPU build",
+        )
+        return
+    try:
+        devices = paddle.device.cuda.device_count()
+    except Exception as exc:  # noqa: BLE001
+        devices = 0
+        _line("FAIL", f"OCR CUDA device probe failed: {exc}")
+    if devices < 1:
+        failures.append("ocr-gpu")
+        _line("FAIL", "ocr.device=gpu but no CUDA device is available")
+        return
+    _line(
+        "OK",
+        f"OCR GPU: {models} (paddle {paddle.__version__}, {devices} device)",
+    )
 
 
 def _check_audio() -> None:
@@ -259,6 +309,7 @@ def main() -> int:
     _check_imports()
     config = _check_config()
     _check_torch(config)
+    _check_ocr(config)
     _check_mt(config)
     _check_audio()
     if config is not None:

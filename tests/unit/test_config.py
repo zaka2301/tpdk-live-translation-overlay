@@ -23,6 +23,8 @@ def test_default_config_loads() -> None:
     assert config.asr.llama_cpp.partial_tail_sec == 0.0
     assert config.asr.llama_cpp.min_energy_dbfs == -40.0
     assert config.mt.translate_partials is True
+    assert config.ocr.device == "gpu"
+    assert config.ocr.enable_mkldnn is False
     assert config.ocr.det_model == "PP-OCRv6_small_det"
     assert config.mt.provider == "plamo_llama"
     assert config.mt.plamo_llama.base_url == "http://127.0.0.1:8082"

@@ -86,6 +86,7 @@ def test_engine_is_lazy_and_reused_until_closed() -> None:
 
     config = OcrConfig(
         device="cpu",
+        enable_mkldnn=True,
         det_model="PP-OCRv6_small_det",
         rec_model="PP-OCRv6_small_rec",
         resize_max_side=960,
@@ -102,6 +103,7 @@ def test_engine_is_lazy_and_reused_until_closed() -> None:
     assert calls[0]["text_recognition_model_name"] == "PP-OCRv6_small_rec"
     assert calls[0]["text_det_limit_side_len"] == 960
     assert calls[0]["text_det_limit_type"] == "max"
+    assert calls[0]["enable_mkldnn"] is True
 
     engine.close()
     engine.recognize(blank)
@@ -134,3 +136,48 @@ def test_recognize_rejects_non_bgr_input() -> None:
         assert "BGR" in str(exc)
     else:  # pragma: no cover - the assertion above is the contract
         raise AssertionError("expected ValueError")
+
+
+def test_gpu_construction_failure_falls_back_to_cpu() -> None:
+    calls: list[dict[str, Any]] = []
+    fake = _FakePaddle([])
+
+    def factory(**kwargs: Any) -> _FakePaddle:
+        calls.append(kwargs)
+        if kwargs["device"] == "gpu":
+            raise RuntimeError("CUDA unavailable")
+        return fake
+
+    engine = PaddleOcrEngine(
+        OcrConfig(device="gpu", enable_mkldnn=True), factory=factory
+    )
+
+    lines = engine.recognize(np.zeros((10, 10, 3), dtype=np.uint8))
+
+    assert lines == []
+    assert [call["device"] for call in calls] == ["gpu", "cpu"]
+    assert calls[1]["enable_mkldnn"] is False
+
+
+def test_gpu_predict_failure_falls_back_to_cpu() -> None:
+    class _FailingGpu:
+        def predict(self, image: np.ndarray) -> list[Any]:
+            raise RuntimeError("CUDA inference failed")
+
+    calls: list[dict[str, Any]] = []
+
+    def factory(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if kwargs["device"] == "gpu":
+            return _FailingGpu()
+        return _FakePaddle([])
+
+    engine = PaddleOcrEngine(
+        OcrConfig(device="gpu", enable_mkldnn=True), factory=factory
+    )
+
+    lines = engine.recognize(np.zeros((10, 10, 3), dtype=np.uint8))
+
+    assert lines == []
+    assert [call["device"] for call in calls] == ["gpu", "cpu"]
+    assert calls[1]["enable_mkldnn"] is False

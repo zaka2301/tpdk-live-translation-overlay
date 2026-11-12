@@ -162,7 +162,8 @@ class ScreenConfig(_Section):
 
 class OcrConfig(_Section):
     enabled: bool = True
-    device: Literal["cpu", "gpu"] = "cpu"
+    device: Literal["cpu", "gpu"] = "gpu"
+    enable_mkldnn: bool = False
     det_model: str = "PP-OCRv6_small_det"
     rec_model: str = "PP-OCRv6_small_rec"
     min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)

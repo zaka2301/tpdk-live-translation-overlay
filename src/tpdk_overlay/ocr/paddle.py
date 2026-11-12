@@ -2,8 +2,9 @@
 
 The engine is initialized lazily (the backend starts without loading OCR) and
 warmed up once at session start. Models are ``PP-OCRv6_small_det`` +
-``PP-OCRv6_small_rec`` on CPU by default: ~7.7M parameters and no VRAM cost, so
-OCR stays inside the 4 GB GPU budget (NFR-05).
+``PP-OCRv6_small_rec`` on GPU by default, with an automatic CPU fallback when
+CUDA is unavailable. GPU OCR costs ~0.7 GB VRAM, leaving room for the ASR server
+inside the 4 GB budget.
 
 PaddleOCR 3.x returns a list of dict-like result objects whose top level holds
 ``rec_texts``, ``rec_polys``, ``rec_scores`` (and ``dt_polys``). Older code paths
@@ -13,8 +14,12 @@ wrap the same payload under ``res``; both shapes are accepted here. The
 
 from __future__ import annotations
 
+import logging
+import os
+import sysconfig
 import threading
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -23,11 +28,57 @@ from tpdk_overlay.config import OcrConfig
 from tpdk_overlay.contracts import BBox
 from tpdk_overlay.ports import ImageArray, OcrLine
 
+logger = logging.getLogger(__name__)
+
 PaddleFactory = Callable[..., Any]
 
 # Blank white canvas fed through the models once so the first real slide does
 # not pay graph construction on the critical path.
 _WARMUP_IMAGE = np.full((64, 256, 3), 255, dtype=np.uint8)
+
+# Paddle's Windows GPU wheels do not bundle CUDA/cuBLAS/cuDNN. The torch wheel
+# installed in this venv carries the CUDA 13 runtime DLLs, so register its lib
+# directory (and CUDA_PATH if set) before paddle is imported.
+_DLL_HANDLES: list[Any] = []
+_DLLS_REGISTERED = False
+
+
+def register_cuda_dlls() -> None:
+    """Make CUDA/cuDNN DLLs visible to the Paddle extension on Windows."""
+
+    global _DLLS_REGISTERED
+    if os.name != "nt" or _DLLS_REGISTERED:
+        return
+    _DLLS_REGISTERED = True
+
+    candidates: list[Path] = []
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        candidates.append(Path(cuda_path) / "bin")
+    torch_lib: Path | None = None
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("torch")
+        if spec is not None and spec.origin:
+            torch_lib = Path(spec.origin).parent / "lib"
+    except Exception:  # noqa: BLE001 - torch is optional for the OCR path
+        torch_lib = None
+    if torch_lib is None:
+        try:
+            torch_lib = Path(sysconfig.get_paths()["purelib"]) / "torch" / "lib"
+        except Exception:  # noqa: BLE001
+            torch_lib = None
+    if torch_lib is not None:
+        candidates.append(torch_lib)
+
+    for path in candidates:
+        if not path.is_dir():
+            continue
+        try:
+            _DLL_HANDLES.append(os.add_dll_directory(str(path)))
+        except OSError:
+            continue
 
 
 def _payload(result: Any) -> Any:
@@ -116,8 +167,27 @@ class PaddleOcrEngine:
         # OCR loop may already be running; creation and inference are serialized.
         self._engine_lock = threading.Lock()
         self._predict_lock = threading.Lock()
+        self._fallback_lock = threading.Lock()
+        self._fell_back = False
+
+    def _mark_fallback(self, exc: BaseException) -> bool:
+        """Switch to CPU once after a GPU failure; return whether we switched."""
+
+        with self._fallback_lock:
+            if self._config.device != "gpu" or self._fell_back:
+                return False
+            self._fell_back = True
+            logger.warning(
+                "GPU OCR unavailable (%s); falling back to CPU (oneDNN disabled)",
+                exc,
+            )
+            self._config = self._config.model_copy(
+                update={"device": "cpu", "enable_mkldnn": False}
+            )
+            return True
 
     def _create_engine(self) -> Any:
+        register_cuda_dlls()
         factory = self._factory
         if factory is None:
             from paddleocr import PaddleOCR as factory
@@ -128,6 +198,7 @@ class PaddleOcrEngine:
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            enable_mkldnn=self._config.enable_mkldnn,
             # The pipeline default is limit_type "min" with a tiny 64 px floor;
             # feeding it resize_max_side would upscale every frame. "max" caps
             # the long side instead (1920x1080 -> 1280x720) and never upscales.
@@ -140,16 +211,39 @@ class PaddleOcrEngine:
         if engine is not None:
             return engine
         with self._engine_lock:
-            if self._engine is None:
+            if self._engine is not None:
+                return self._engine
+            try:
+                self._engine = self._create_engine()
+            except Exception as exc:  # noqa: BLE001 - CPU fallback below
+                if not self._mark_fallback(exc):
+                    raise
                 self._engine = self._create_engine()
             return self._engine
+
+    def _predict(self, image: Any) -> Any:
+        engine = self._ensure_engine()
+        with self._predict_lock:
+            try:
+                return engine.predict(image)
+            except Exception as exc:  # noqa: BLE001 - GPU may fail at inference
+                if self._fell_back:
+                    # Another worker may have replaced the failing engine.
+                    with self._engine_lock:
+                        fallback_engine = self._engine
+                    if fallback_engine is not None and fallback_engine is not engine:
+                        return fallback_engine.predict(image)
+                if not self._mark_fallback(exc):
+                    raise
+                with self._engine_lock:
+                    self._engine = None
+                engine = self._ensure_engine()
+                return engine.predict(image)
 
     def warmup(self) -> None:
         """Load the models and run one tiny inference; call off the event loop."""
 
-        engine = self._ensure_engine()
-        with self._predict_lock:
-            engine.predict(_WARMUP_IMAGE)
+        self._predict(_WARMUP_IMAGE)
 
     def recognize(self, image: ImageArray) -> list[OcrLine]:
         """Detect and recognize text in a BGR frame, in reading order."""
@@ -157,9 +251,7 @@ class PaddleOcrEngine:
         if image.ndim != 3 or image.shape[2] < 3:
             raise ValueError(f"expected a BGR image, got shape {image.shape!r}")
         height, width = image.shape[:2]
-        engine = self._ensure_engine()
-        with self._predict_lock:
-            results = engine.predict(image)
+        results = self._predict(image)
         return _iter_lines(results, width, height)
 
     def close(self) -> None:
@@ -169,4 +261,4 @@ class PaddleOcrEngine:
             self._engine = None
 
 
-__all__ = ["PaddleFactory", "PaddleOcrEngine"]
+__all__ = ["PaddleFactory", "PaddleOcrEngine", "register_cuda_dlls"]
