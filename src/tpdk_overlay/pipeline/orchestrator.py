@@ -545,9 +545,10 @@ class Orchestrator:
             ports = self._ports_factory(self._ports_config)
             self._ports = ports
             await asyncio.to_thread(ports.asr_client.warmup)
-            # NLLB loads in 12-23 s on this machine. Do not hold capture hostage
-            # to it: source captions should start now, and MT jobs queue behind
-            # the one-time load. Repeat sessions reuse the loaded model.
+            # Warm the translator in the background: the PLaMo server is already
+            # loaded (this is just a health check), and NLLB loads in 12-23 s.
+            # Do not hold capture hostage to it: source captions should start
+            # now, and MT jobs queue behind the one-time load.
             translator_warmup = getattr(ports.translator, "warmup", None)
             if callable(translator_warmup):
                 threading.Thread(
@@ -562,14 +563,18 @@ class Orchestrator:
             if self._stop_event.is_set():
                 return
 
+            # Build the VAD before capture starts. Starting the capture thread
+            # first lets scipy's resampler probe torch while Silero is still
+            # importing it, which fails with a partially initialized torch.
+            factory = ports.segmenter_factory or self._default_segmenter_factory()
+            self._segmenter = await asyncio.to_thread(factory)
+
             await asyncio.to_thread(ports.audio_source.start)
             if self._stop_event.is_set():
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(ports.audio_source.stop)
                 return
 
-            factory = ports.segmenter_factory or self._default_segmenter_factory()
-            self._segmenter = await asyncio.to_thread(factory)
             reset = getattr(ports.change_detector, "reset", None)
             if callable(reset):
                 reset()

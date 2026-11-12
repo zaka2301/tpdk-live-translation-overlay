@@ -29,6 +29,7 @@ from tpdk_overlay.contracts import (
     TranscriptSegmentEvent,
     TranslationStatus,
 )
+from tpdk_overlay.mt.languages import supported_languages
 from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
 from tpdk_overlay.ui.client import Backoff, OverlayClient
 
@@ -207,6 +208,22 @@ def _segment(
         translation=translation,
         translation_status=translation_status,
     )
+
+
+def test_caption_language_menu_matches_provider(qt_app: QApplication) -> None:
+    window = CaptionWindow(
+        UiConfig(),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+        languages=supported_languages("plamo_llama"),
+    )
+    try:
+        codes = set(window.language_codes())
+    finally:
+        window.close()
+    assert {"en", "id", "zh-hans", "zh-hant", "tl"} <= codes
+    assert {"pt", "el", "tr", "yue"}.isdisjoint(codes)
 
 
 def test_caption_ignores_stale_revisions(qt_app: QApplication) -> None:

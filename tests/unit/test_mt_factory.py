@@ -18,6 +18,16 @@ def test_factory_selects_transformer_adapter() -> None:
         translator.close()
 
 
+def test_factory_selects_plamo_adapter() -> None:
+    from tpdk_overlay.mt.plamo import PlamoTranslator
+
+    translator = create_translator(MtConfig(provider="plamo_llama"))
+    try:
+        assert isinstance(translator, PlamoTranslator)
+    finally:
+        translator.close()
+
+
 def test_factory_selects_ct2_adapter() -> None:
     from tpdk_overlay.mt.nllb_ct2 import NllbCt2Translator
 

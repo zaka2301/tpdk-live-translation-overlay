@@ -1,21 +1,24 @@
 """One-command launcher for the whole TPdK overlay stack.
 
-Starts and supervises the three local processes the prototype needs:
+Starts and supervises the four local processes the prototype needs:
 
 1. the Qwen3-ASR GGUF server (``llama serve``, used by ``asr.backend:
    llama_cpp``),
-2. the FastAPI backend (``tpdk_overlay.server.app``), and
-3. the PySide6 overlay (``tpdk_overlay.ui.app``).
+2. the PLaMo-3-Translate GGUF server (``llama serve``, used by
+   ``mt.provider: plamo_llama``),
+3. the FastAPI backend (``tpdk_overlay.server.app``), and
+4. the PySide6 overlay (``tpdk_overlay.ui.app``).
 
 The overlay is the foreground UI. Quit it from the tray (Quit) or press Ctrl+C
-in this console; the backend and ASR server this launcher started are stopped
-afterwards. Services that were already healthy before the launch are reused and
-left running.
+in this console; the backend and the llama servers this launcher started are
+stopped afterwards. Services that were already healthy before the launch are
+reused and left running.
 
 Usage::
 
     python main.py                 # starts everything
     python main.py --no-asr        # reuse an ASR server you started yourself
+    python main.py --no-mt         # reuse a PLaMo server you started yourself
     python main.py --no-backend    # reuse a backend you started yourself
     python main.py --model ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0
 
@@ -46,6 +49,7 @@ VENV_PYTHON = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bi
 DEFAULT_ASR_MODEL = "ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0"
 
 ASR_START_TIMEOUT_S = 300.0  # first run downloads the GGUF checkpoint
+MT_START_TIMEOUT_S = 300.0  # same, for the PLaMo translation server
 BACKEND_START_TIMEOUT_S = 60.0
 SERVICE_GRACE_S = 20.0  # another instance may still be loading
 STOP_TIMEOUT_S = 5.0
@@ -219,6 +223,78 @@ def _start_asr(config, model: str) -> Service:
     return Service(health_url=health_url, proc=proc)
 
 
+def _mt_command(config, llama_exe: str) -> tuple[list[str], str, str, int]:
+    plamo = config.mt.plamo_llama
+    base = plamo.base_url
+    health_url, host, port = _endpoint(base, "/health")
+    bind_host = urlparse(base).hostname or "127.0.0.1"
+    model_path = config.resolve(Path(plamo.model_path))
+    model_args = (
+        ["-m", str(model_path)]
+        if model_path.is_file()
+        else ["-hf", plamo.hf_model]
+    )
+    command = [
+        llama_exe,
+        "serve",
+        *model_args,
+        "--host",
+        bind_host,
+        "--port",
+        str(port),
+        "--alias",
+        plamo.model,
+        "-ngl",
+        "all",
+        "-c",
+        str(plamo.context_size),
+        "-np",
+        str(plamo.concurrency),
+        "--jinja",
+        "--no-prefill-assistant",
+    ]
+    return command, health_url, host, port
+
+
+def _start_mt(config) -> Service:
+    """Spawn the PLaMo ``llama serve`` process when the provider needs it."""
+
+    if config.mt.provider != "plamo_llama":
+        print(
+            f"[launcher] mt.provider is {config.mt.provider!r}; "
+            "not starting the PLaMo server",
+            flush=True,
+        )
+        return Service(health_url="")
+
+    command, health_url, host, port = _mt_command(config, "llama")
+
+    if _http_ok(health_url):
+        print(
+            f"[launcher] PLaMo server already healthy at {health_url}; reusing it",
+            flush=True,
+        )
+        return Service(health_url=health_url)
+    if _port_open(host, port):
+        print(f"[launcher] port {port} is already in use; waiting for {health_url}", flush=True)
+        _wait_for_health("PLaMo server", health_url, None, SERVICE_GRACE_S)
+        return Service(health_url=health_url)
+
+    llama_exe = shutil.which("llama")
+    if llama_exe is None:
+        raise LauncherError(
+            "llama CLI not found on PATH. It is required by mt.provider: "
+            "plamo_llama; install it with `irm https://llama.app/install.ps1 | iex` "
+            "or switch mt.provider to nllb_ct2."
+        )
+    command[0] = llama_exe
+    print(f"[launcher] starting PLaMo translation server on {health_url}", flush=True)
+    if "-hf" in command:
+        print("[launcher] (the first run downloads the GGUF model)", flush=True)
+    proc = subprocess.Popen(command, cwd=str(ROOT), stdin=subprocess.DEVNULL)
+    return Service(health_url=health_url, proc=proc)
+
+
 def _start_backend(config) -> Service:
     base = f"http://{config.server.host}:{config.server.port}"
     health_url, host, port = _endpoint(base, "/api/health")
@@ -268,6 +344,11 @@ def main(argv: list[str] | None = None) -> int:
         help="do not start llama serve; reuse an ASR server that is already running",
     )
     parser.add_argument(
+        "--no-mt",
+        action="store_true",
+        help="do not start the PLaMo server; reuse one that is already running",
+    )
+    parser.add_argument(
         "--no-backend",
         action="store_true",
         help="do not start the backend; reuse one that is already running",
@@ -277,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     spawned: dict[str, subprocess.Popen[bytes] | None] = {
         "overlay": None,
         "backend": None,
+        "PLaMo server": None,
         "ASR server": None,
     }
     try:
@@ -288,6 +370,14 @@ def main(argv: list[str] | None = None) -> int:
             if asr.proc is not None:
                 _wait_for_health(
                     "ASR server", asr.health_url, asr.proc, ASR_START_TIMEOUT_S
+                )
+
+        if not args.no_mt:
+            mt = _start_mt(config)
+            spawned["PLaMo server"] = mt.proc
+            if mt.proc is not None:
+                _wait_for_health(
+                    "PLaMo server", mt.health_url, mt.proc, MT_START_TIMEOUT_S
                 )
 
         if not args.no_backend:
@@ -323,8 +413,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[launcher] unexpected error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
-        # Overlay first, then the backend, then the ASR server.
-        for name in ("overlay", "backend", "ASR server"):
+        # Overlay first, then the backend, then the model servers.
+        for name in ("overlay", "backend", "PLaMo server", "ASR server"):
             _stop(spawned[name], name)
 
 

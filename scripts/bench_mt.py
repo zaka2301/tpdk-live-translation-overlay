@@ -216,7 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark one NLLB-200 adapter configuration (one per process).",
     )
-    parser.add_argument("--provider", choices=("nllb", "nllb_ct2"), default=None)
+    parser.add_argument("--provider", choices=("nllb", "nllb_ct2"), default="nllb_ct2")
     parser.add_argument(
         "--device",
         default=None,

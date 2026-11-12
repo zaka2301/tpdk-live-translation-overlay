@@ -23,7 +23,7 @@ audio:
     threshold: 0.5
     min_speech_ms: 250
     min_silence_ms: 450
-    max_utterance_ms: 10000  # hard subtitle cap; longer speech becomes a new segment
+    max_utterance_ms: 8000  # hard subtitle cap; longer speech becomes a new segment
     pre_roll_ms: 300
 
 asr:
@@ -48,9 +48,11 @@ asr:
     system_prompt: ""          # experimental; empty = no system message
 
 mt:
-  # Default: CTranslate2 int8 on CPU (zero VRAM; keeps the 4 GB GPU for ASR).
-  # nllb = transformers fp16 GPU path; set device: cuda when switching.
-  provider: nllb_ct2
+  # Default: PLaMo-3-Translate 0.8B GGUF on the GPU, served by a local
+  # `llama serve` process (start scripts\serve_mt_plamo.ps1 or use main.py).
+  # nllb_ct2 = CTranslate2 int8 on CPU (zero VRAM); nllb = transformers fp16
+  # GPU path, enabled with device: cuda.
+  provider: plamo_llama
   model: facebook/nllb-200-distilled-600M
   device: cpu
   dtype: float16        # nllb only; CPU inference is forced to float32
@@ -61,6 +63,15 @@ mt:
     model: data/models/nllb-ct2
     compute_type: int8
     max_new_tokens: 256
+  plamo_llama:          # used only when provider: plamo_llama
+    base_url: http://127.0.0.1:8082
+    model: plamo-translate          # llama serve --alias
+    model_path: data/models/plamo-3-translate/plamo-3-translate-0.8b-Q4_K_M.gguf
+    hf_model: pfnet/plamo-3-translate-0.8b-GGUF:Q4_K_M  # fallback when model_path is missing
+    context_size: 16384
+    max_new_tokens: 256
+    timeout_s: 30
+    concurrency: 8      # match the server's -np slot count
 
 screen:
   enabled: true
@@ -92,14 +103,14 @@ summary:
 
 ui:
   caption:
-    width: 1100
-    height: 260           # fits ~3-4 translation lines at the default font
+    width: 1200
+    height: 300           # fits ~3-4 translation lines at the default font
     anchor: bottom-center
-    opacity: 0.55
+    opacity: 0.30
     font_family: Segoe UI
-    font_size: 18
-    translation_font_size: 18
-    final_hold_ms: 2200     # minimum reading time for a translated final
+    font_size: 15
+    translation_font_size: 15
+    final_hold_ms: 3500     # minimum reading time for a translated final
   ocr_overlay:
     enabled: true
     background: "#101418"

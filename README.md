@@ -5,39 +5,41 @@ It captures lecture audio and a chosen screen region, transcribes and translates
 locally, extracts slide text locally, and writes periodic and final summaries.
 
 The selected architecture is the hybrid local–cloud alternative (Bab III §3.3.5):
-Qwen3-ASR-0.6B (vLLM streaming), NLLB-200-distilled-600M, and PP-OCRv6_small run
-on the machine; only the summarizer calls the cloud (Gemini API). Audio and
-screen pixels never leave the device, and only text reaches the cloud.
+Qwen3-ASR-0.6B, PLaMo-3-Translate-0.8B (GGUF, GPU), and PP-OCRv6_small run on the
+machine; NLLB-200-distilled-600M remains the CPU fallback. Only the summarizer
+calls the cloud (Gemini API). Audio and screen pixels never leave the device,
+and only text reaches the cloud.
 
 On this workstation the machine default is `asr.backend: llama_cpp`: Qwen3-ASR
 runs as a GGUF model in a local `llama serve` process and captions get partial
 previews every 5 s. `http` (vLLM in WSL2) remains the report path.
-See [ASR backends](#asr-backends). Translation defaults to `nllb_ct2`
-(CTranslate2 int8 on CPU, zero VRAM); see
-[Translation](#translation-nllb-200).
+See [ASR backends](#asr-backends). Translation defaults to `plamo_llama`:
+PLaMo-3-Translate 0.8B GGUF on the GPU behind a second `llama serve` process;
+see [Translation](#translation-plamo--nllb-200).
 
 Implementation status and the build order live in [AGENTS.md](AGENTS.md).
 
 ## One command
 
-`main.py` starts and supervises the three local processes:
+`main.py` starts and supervises the four local processes:
 
 ```powershell
 python main.py
 ```
 
 If `python` is not the project venv, the launcher restarts itself with
-`.venv\Scripts\python.exe`. It waits for the ASR server and backend health
+`.venv\Scripts\python.exe`. It waits for the ASR, PLaMo, and backend health
 endpoints before opening the overlay, reuses services that are already running,
 and stops the ones it started when the overlay exits (tray **Quit** or Ctrl+C).
-`--no-asr`, `--no-backend`, and `--model <llama -hf spec>` are available for
-partial stacks and alternate checkpoints.
+`--no-asr`, `--no-mt`, `--no-backend`, and `--model <llama -hf spec>` are
+available for partial stacks and alternate checkpoints.
 
 ## Processes
 
 | Process | Where | Command |
 |---|---|---|
 | ASR server (Qwen3-ASR GGUF + llama.cpp) | Windows, `127.0.0.1:8081` | `powershell -File scripts\serve_asr_llama.ps1` |
+| PLaMo translation server (GGUF + llama.cpp) | Windows, `127.0.0.1:8082` | `powershell -File scripts\serve_mt_plamo.ps1` |
 | ASR service (Qwen3-ASR + vLLM, optional) | WSL2 Ubuntu, `127.0.0.1:8000` | `bash scripts/serve_asr_wsl.sh` |
 | Backend (capture, MT, OCR, summaries) | Windows | `.\.venv\Scripts\python.exe -m tpdk_overlay.server.app` |
 | Overlay UI (PySide6) | Windows | `powershell -File scripts\run_overlay.ps1` |
@@ -47,9 +49,9 @@ The backend listens on `127.0.0.1:8765`: `GET /api/health` and WebSocket `/ws`.
 
 ## Caption overlay
 
-`python main.py` starts the ASR server, backend, and overlay together. To run the
-pieces manually instead, start the backend first and the overlay in a second
-terminal:
+`python main.py` starts the ASR server, PLaMo server, backend, and overlay
+together. To run the pieces manually instead, start the backend first and the
+overlay in a second terminal:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\run_overlay.ps1
@@ -76,10 +78,16 @@ it cannot lock itself out.
 Source text stays small and the translation is large. Partials replace the
 current segment, finals accumulate in history, and the UI acknowledges every
 painted final with `render.ack` so NFR-01/NFR-03 latency rows can be computed.
-The backend starts capture without waiting for NLLB: source captions appear about two seconds after speech starts (the llama.cpp
+The backend starts capture without waiting for the translation model: source captions appear about two seconds after speech starts (the llama.cpp
 preview cadence), the translation model finishes loading in the
 background (the first segment may show `translating...` briefly), and the model
 stays loaded for later sessions so subsequent Starts are sub-second.
+The VAD caps one utterance at 10 s, and the caption ellipsizes anything that
+still overflows (newest words for a partial, the sentence start for a final);
+the full text is always available in History. A translated final stays on
+screen for at least `ui.caption.final_hold_ms` (2.2 s by default); partials and
+source-only previews are coalesced during that hold, while resolved finals
+always paint so their latency measurement is not lost.
 The WebSocket client runs on a background thread with 0.5 s -> 5 s capped
 backoff, so a restarted backend is picked up within five seconds; the status
 line shows `backend offline - retrying` in the meantime.
@@ -136,8 +144,8 @@ preview still arrives near 5 s of audio, so this is a chunked preview, not
 NFR-02's ≤1 s first-partial target.
 
 `http` is the report's streaming service. It runs in WSL2 and shares the 4 GB
-GPU with NLLB; if VRAM is tight, prefer `llama_cpp` or a smaller/quantized HTTP
-model.
+GPU with the translation model; if VRAM is tight, prefer `llama_cpp` or a
+smaller/quantized HTTP model.
 
 ```powershell
 # Optional override (default is llama_cpp in configs/default.yaml)
@@ -145,19 +153,55 @@ $env:TPDK__ASR__BACKEND = "http"     # vLLM service in WSL2
 .\.venv\Scripts\python.exe -m tpdk_overlay.server.app
 ```
 
-## Translation (NLLB-200)
+## Translation (PLaMo / NLLB-200)
 
-`mt.provider` selects how the same `facebook/nllb-200-distilled-600M`
-checkpoint runs. Only final transcripts and OCR blocks reach this stage; no
-audio or pixels are involved.
+`mt.provider` selects how final transcripts and OCR blocks are translated; no
+audio or pixels reach this stage.
 
-| `mt.provider` | Runs as | Device | Dependency |
+| `mt.provider` | Runs as | Device | Server / dependency |
 |---|---|---|---|
-| `nllb_ct2` (default) | CTranslate2 int8 | CPU (zero VRAM), CUDA optional | `ct2` extra |
+| `plamo_llama` (default) | PLaMo-3-Translate 0.8B GGUF, Q4_K_M | GPU (`-ngl all`) | local `llama serve` on `127.0.0.1:8082` |
+| `nllb_ct2` | CTranslate2 int8 | CPU (zero VRAM), CUDA optional | `ct2` extra + converted model |
 | `nllb` | transformers, fp16 | CUDA when available, CPU float32 otherwise | `ml` extra |
 
-The default CT2 path keeps the 4 GB GPU free for ASR. The `ct2` extra and one
-conversion are required on first use (the output directory is gitignored):
+PLaMo runs in its own llama.cpp process. `main.py` starts it with the rest of
+the stack; to start it alone:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\serve_mt_plamo.ps1
+```
+
+The GGUF is read from `data/models/plamo-3-translate/` when it exists; otherwise
+the launcher downloads `pfnet/plamo-3-translate-0.8b-GGUF:Q4_K_M` on first run.
+PLaMo adds ~0.7 GiB VRAM next to the ASR server's ~1.7 GiB; both measured
+together at ~2.6 GiB of the 4 GB card.
+
+Measured on this workstation (RTX 3050, Ryzen 5 5600H, the eight lecture
+sentences from `scripts/bench_mt.py`): PLaMo Q4_K_M on the GPU has p50 ≈ 0.16 s
+en→id and ≈ 0.10 s id→en, 0.72 GiB VRAM, 0.96 GiB server RSS. On CPU (6
+threads) it is p50 ≈ 1.13 s / 0.65 s, too slow for the caption path. NLLB CT2
+int8 on CPU is p50 ≈ 0.63 s / 0.86 s at 1.46 GiB RAM and zero VRAM; NLLB fp16 on
+CUDA is p50 ≈ 0.44 s / 0.46 s at 1.22 GiB VRAM. PLaMo needs a second `llama
+serve`; NLLB runs in-process.
+
+Batches (OCR blocks) are fanned out to `mt.plamo_llama.concurrency` parallel
+requests; keep that at or below the server's `-np` slots. Supported languages
+are the 53 PLaMo codes; `zh` maps to `zh-hans` and `fil` to `tl`. The overlay's
+From/To menus are built from the active provider's set, so unsupported pairs
+cannot be selected. Unsupported pairs fail per segment and leave the source
+text visible. Always pass
+`source_lang`/`target_lang`: omitting `target_lang` makes the model switch
+between Japanese and English.
+
+To use the CPU fallback instead:
+
+```powershell
+$env:TPDK__MT__PROVIDER = "nllb_ct2"
+.\.venv\Scripts\python.exe -m tpdk_overlay.server.app
+```
+
+The `ct2` extra and one conversion are required on first use (the output
+directory is gitignored):
 
 ```powershell
 .\.venv\Scripts\pip.exe install -e ".[ct2]"
@@ -168,26 +212,12 @@ conversion are required on first use (the output directory is gitignored):
 
 If a conversion already exists (for example the old Live Subtitle prototype's
 `Live Subtitle/models/nllb-ct2`), point `mt.ct2.model` at that directory instead
-of re-converting.
-
-Then the default runs with no overrides. To use the optional GPU path instead:
-
-```powershell
-$env:TPDK__MT__PROVIDER = "nllb"
-$env:TPDK__MT__DEVICE = "cuda"
-.\.venv\Scripts\python.exe -m tpdk_overlay.server.app
-```
+of re-converting. The optional GPU path is `TPDK__MT__PROVIDER=nllb` with
+`TPDK__MT__DEVICE=cuda`.
 
 `mt.batch_size` caps both sentence and OCR-block batches; `mt.max_new_tokens`
 bounds the translation length, not the input (`mt.max_input_tokens` truncates
-long inputs).
-
-Measured on this workstation (RTX 3050 4 GB, Ryzen 5 5600H, 8 lecture
-sentences): the default `nllb_ct2` int8 on CPU has p50 ≈ 0.79–0.84 s/sentence
-at 1.46 GB RAM and zero VRAM; `nllb` fp16 on CUDA has p50 ≈ 0.46–0.49 s/sentence
-at 1.22 GB VRAM and 1.73 GB RAM; `nllb` fp32 on CPU is ≈ 2.3 s/sentence at
-3.2 GB RAM. The CT2 default keeps the GPU with ASR; use `nllb` on CUDA when
-there is VRAM headroom. See AGENT.md §7 for the full table.
+long inputs for NLLB).
 
 ## First-time setup
 
@@ -217,5 +247,7 @@ variable using `TPDK__` and `__` nesting, e.g. `TPDK__SERVER__PORT=9000`,
 
 ## Licenses
 
-NLLB-200 is CC-BY-NC-4.0 (non-commercial); Gemini free tier may use inputs for
-product improvement. This project targets the academic TPdK prototype only.
+NLLB-200 is CC-BY-NC-4.0 (non-commercial). PLaMo-3-Translate is released under
+the PLaMo Community License, which is free for personal and academic use.
+Gemini free tier may use inputs for product improvement. This project targets
+the academic TPdK prototype only.

@@ -10,8 +10,9 @@ Conventions
 * ``t_*_ms`` fields on payloads are **session-relative** monotonic milliseconds,
   starting at 0 when the session starts. They never jump when the OS clock
   changes.
-* Language codes on the wire are ISO 639-1 (``"en"``, ``"id"``). NLLB/ASR
-  dialect codes stay inside their adapters.
+* Language codes on the wire are ISO 639-1 (``"en"``, ``"id"``). Model dialect
+  codes (NLLB FLORES, PLaMo codes) and ASR language tags stay inside their
+  adapters.
 * Events are immutable. Build a new event instead of mutating one.
 
 Requirement anchors (Bab III, Tabel 3.7/3.8): FR-02 (partial/final transcript

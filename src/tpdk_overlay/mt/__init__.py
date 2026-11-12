@@ -1,14 +1,17 @@
-"""NLLB-200 translation adapters (FR-03).
+"""Translation adapters (FR-03).
 
 ``create_translator`` selects the implementation from ``mt.provider`` without
-importing torch or CTranslate2 until a model is actually requested:
+importing torch, CTranslate2, or opening an HTTP client until a model is
+actually requested:
 
-* ``nllb_ct2`` — CTranslate2 int8 on CPU (default; zero VRAM, keeps the 4 GB
-  GPU for ASR).
+* ``plamo_llama`` — PLaMo-3-Translate 0.8B GGUF behind a local ``llama serve``
+  process on the GPU (default; the server must be running).
+* ``nllb_ct2`` — CTranslate2 int8 on CPU (zero VRAM, keeps the 4 GB GPU for
+  ASR).
 * ``nllb`` — transformers, fp16 on CUDA when available (optional GPU path).
 
-Both adapters lazily load their model on a dedicated worker thread and preserve
-batch order; see :mod:`tpdk_overlay.mt.base`.
+All adapters lazily load on a dedicated worker thread and preserve batch order;
+see :mod:`tpdk_overlay.mt.base`.
 """
 
 from __future__ import annotations
@@ -21,6 +24,10 @@ from tpdk_overlay.ports import Translator
 def create_translator(config: MtConfig) -> Translator:
     """Build the configured translator; model loading stays lazy."""
 
+    if config.provider == "plamo_llama":
+        from tpdk_overlay.mt.plamo import PlamoTranslator
+
+        return PlamoTranslator(config)
     if config.provider == "nllb":
         from tpdk_overlay.mt.nllb import NllbTranslator
 

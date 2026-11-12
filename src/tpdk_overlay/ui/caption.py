@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -67,35 +68,70 @@ SCREEN_MARGIN = 48
 
 LANGUAGE_NAMES: dict[str, str] = {
     "ar": "Arabic",
+    "az": "Azerbaijani",
+    "be": "Belarusian",
+    "bg": "Bulgarian",
+    "bn": "Bengali",
+    "ca": "Catalan",
+    "ceb": "Cebuano",
     "cs": "Czech",
     "da": "Danish",
     "de": "German",
     "el": "Greek",
     "en": "English",
     "es": "Spanish",
+    "et": "Estonian",
+    "eu": "Basque",
     "fa": "Persian",
     "fi": "Finnish",
     "fil": "Filipino",
     "fr": "French",
+    "gu": "Gujarati",
+    "he": "Hebrew",
     "hi": "Hindi",
+    "hr": "Croatian",
     "hu": "Hungarian",
+    "hy": "Armenian",
     "id": "Indonesian",
     "it": "Italian",
     "ja": "Japanese",
+    "jv": "Javanese",
+    "ka": "Georgian",
+    "kk": "Kazakh",
+    "km": "Khmer",
     "ko": "Korean",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
     "mk": "Macedonian",
+    "ml": "Malayalam",
+    "mr": "Marathi",
     "ms": "Malay",
+    "my": "Burmese",
+    "ne": "Nepali",
     "nl": "Dutch",
+    "pa": "Punjabi",
     "pl": "Polish",
     "pt": "Portuguese",
     "ro": "Romanian",
     "ru": "Russian",
+    "si": "Sinhala",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "sr": "Serbian",
     "sv": "Swedish",
+    "sw": "Swahili",
+    "ta": "Tamil",
+    "te": "Telugu",
     "th": "Thai",
+    "tl": "Tagalog",
     "tr": "Turkish",
+    "ur": "Urdu",
+    "uz": "Uzbek",
     "vi": "Vietnamese",
     "yue": "Cantonese",
     "zh": "Chinese",
+    "zh-hans": "Chinese (Simplified)",
+    "zh-hant": "Chinese (Traditional)",
 }
 
 
@@ -175,6 +211,7 @@ class CaptionWindow(QWidget):
         source_lang: str,
         target_lang: str,
         checkpoint_interval_s: int,
+        languages: Sequence[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -184,6 +221,7 @@ class CaptionWindow(QWidget):
             | Qt.WindowType.Tool,
         )
         self._caption = ui.caption
+        self._languages = tuple(languages) if languages is not None else tuple(ISO_TO_NLLB)
         self._click_through = bool(ui.click_through)
         self._state = SessionState.IDLE
         self._connected = False
@@ -256,7 +294,7 @@ class CaptionWindow(QWidget):
         self._target_combo.currentIndexChanged.connect(self._emit_languages)
         row.addWidget(self._target_combo)
 
-        for code in sorted(ISO_TO_NLLB, key=language_label):
+        for code in sorted(self._languages, key=language_label):
             label = language_label(code)
             self._source_combo.addItem(label, code)
             self._target_combo.addItem(label, code)
@@ -677,12 +715,23 @@ class CaptionWindow(QWidget):
         if source and target:
             self.languagesChanged.emit(str(source), str(target))
 
-    @staticmethod
-    def _select_language(combo: QComboBox, code: str) -> None:
+    def language_codes(self) -> list[str]:
+        """Codes currently offered in the From/To menus."""
+
+        return [
+            str(self._source_combo.itemData(index))
+            for index in range(self._source_combo.count())
+        ]
+
+    def _select_language(self, combo: QComboBox, code: str) -> None:
         index = combo.findData(code)
         if index < 0:
-            combo.addItem(language_label(code), code)
-            index = combo.findData(code)
+            logger.warning(
+                "language %r is not offered by the configured translator; "
+                "the menu keeps its current selection",
+                code,
+            )
+            return
         with QSignalBlocker(combo):
             combo.setCurrentIndex(index)
 

@@ -1,15 +1,17 @@
-"""Shared single-worker machinery for the NLLB adapters.
+"""Shared single-worker machinery for the translation adapters.
 
-Both adapters load their model lazily on a dedicated thread and serve one batch
+Adapters load their model lazily on a dedicated thread and serve one batch
 at a time. That gives the model a stable thread affinity (CUDA contexts and
 CTranslate2 translators are not cheap to move between threads) and enforces the
 "single GPU writer" rule: callers may submit from the asyncio loop or worker
 threads, but inference is serialized.
 
 Subclasses implement :meth:`WorkerTranslator._load`,
-:meth:`WorkerTranslator._translate_batch`, and optionally
-:meth:`WorkerTranslator._release`. They receive FLORES-200 codes, non-empty
-texts, and must return exactly one translation per input.
+:meth:`WorkerTranslator._translate_batch`, optionally
+:meth:`WorkerTranslator._release`, and may override
+:meth:`WorkerTranslator._language_codes` when the adapter does not use NLLB
+FLORES codes. They receive normalized codes, non-empty texts, and must return
+exactly one translation per input.
 """
 
 from __future__ import annotations
@@ -60,8 +62,7 @@ class WorkerTranslator:
         items = list(texts)
         if not items:
             return []
-        source = to_nllb(source_lang)
-        target = to_nllb(target_lang)
+        source, target = self._language_codes(source_lang, target_lang)
         if source == target:
             return items
 
@@ -89,6 +90,11 @@ class WorkerTranslator:
             self._release()
 
     # -- worker-thread hooks -------------------------------------------------
+
+    def _language_codes(self, source_lang: str, target_lang: str) -> tuple[str, str]:
+        """Map public language tags onto this adapter's code space."""
+
+        return to_nllb(source_lang), to_nllb(target_lang)
 
     def _load(self) -> None:
         """Load model resources on the worker thread; raise TranslationError."""

@@ -113,14 +113,31 @@ class MtCt2Config(_Section):
     max_new_tokens: int = Field(default=256, gt=0)
 
 
-class MtConfig(_Section):
-    """Translation defaults to CTranslate2 int8 on CPU (zero VRAM).
+class PlamoMtConfig(_Section):
+    """PLaMo-3-Translate GGUF served by a separate local ``llama serve`` process."""
 
-    Set ``provider: nllb`` and ``device: cuda`` for the optional transformers
-    fp16 GPU path.
+    base_url: str = "http://127.0.0.1:8082"
+    model: str = "plamo-translate"  # llama serve --alias, also the API model name
+    model_path: str = (
+        "data/models/plamo-3-translate/plamo-3-translate-0.8b-Q4_K_M.gguf"
+    )
+    hf_model: str = "pfnet/plamo-3-translate-0.8b-GGUF:Q4_K_M"
+    context_size: int = Field(default=16384, gt=0)
+    max_new_tokens: int = Field(default=256, gt=0)
+    timeout_s: float = Field(default=30.0, gt=0)
+    concurrency: int = Field(default=8, gt=0)  # keep <= llama serve -np
+
+
+class MtConfig(_Section):
+    """Translation defaults to PLaMo GGUF on the GPU (``plamo_llama``).
+
+    PLaMo runs out of process in a local ``llama serve`` instance; start it
+    with ``scripts\\serve_mt_plamo.ps1``. Set ``provider: nllb_ct2`` for the
+    CTranslate2 int8 CPU path (zero VRAM), or ``provider: nllb`` and
+    ``device: cuda`` for the optional transformers fp16 path.
     """
 
-    provider: Literal["nllb", "nllb_ct2"] = "nllb_ct2"
+    provider: Literal["plamo_llama", "nllb", "nllb_ct2"] = "plamo_llama"
     model: str = "facebook/nllb-200-distilled-600M"
     device: str = "cpu"
     dtype: Literal["float16", "bfloat16", "float32"] = "float16"
@@ -128,6 +145,7 @@ class MtConfig(_Section):
     max_new_tokens: int = Field(default=256, gt=0)
     batch_size: int = Field(default=8, gt=0)
     ct2: MtCt2Config = MtCt2Config()
+    plamo_llama: PlamoMtConfig = PlamoMtConfig()
 
 
 class ScreenConfig(_Section):

@@ -42,7 +42,7 @@ OPTIONAL_MODULES = {
     "torch": "NLLB transformers path (optional GPU)",
     "transformers": "NLLB tokenizer / transformers path",
     "sentencepiece": "NLLB tokenizer",
-    "ctranslate2": "default MT (nllb_ct2 int8)",
+    "ctranslate2": "NLLB CT2 fallback (int8)",
     "silero_vad": "voice activity detection",
     "paddle": "PP-OCRv6 runtime",
     "paddleocr": "slide OCR",
@@ -209,7 +209,31 @@ def _check_asr(base_url: str) -> None:
 
 
 def _check_mt(config: AppConfig | None) -> None:
-    if config is None or config.mt.provider != "nllb_ct2":
+    if config is None:
+        return
+    if config.mt.provider == "plamo_llama":
+        base_url = config.mt.plamo_llama.base_url.rstrip("/")
+        try:
+            import httpx
+
+            response = httpx.get(f"{base_url}/health", timeout=2.0)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            warnings.append("plamo-server")
+            _line(
+                "WARN",
+                f"PLaMo translation server not reachable at {base_url}: {exc}; "
+                "start scripts\\serve_mt_plamo.ps1",
+            )
+            return
+        if isinstance(payload, dict) and payload.get("status") in (None, "ok", "ready"):
+            _line("OK", f"PLaMo translation server ready at {base_url}")
+        else:
+            warnings.append("plamo-server")
+            _line("WARN", f"PLaMo server at {base_url} is not ready: {payload}")
+        return
+    if config.mt.provider != "nllb_ct2":
         return
     try:
         import ctranslate2  # noqa: F401 - presence is reported by the import check

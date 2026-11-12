@@ -50,6 +50,7 @@ from tpdk_overlay.contracts import (
     TranscriptSegmentEvent,
     TranslationStatus,
 )
+from tpdk_overlay.mt.languages import supported_languages
 from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
 from tpdk_overlay.ui.client import OverlayClient
 from tpdk_overlay.utils.clock import now_ms
@@ -199,6 +200,20 @@ def _app_icon() -> QIcon:
     return QIcon(pixmap)
 
 
+def _supported_language(code: str, languages: list[str], preferred: str) -> str:
+    """Coerce a configured language onto the active provider's supported set."""
+
+    if code in languages:
+        return code
+    fallback = preferred if preferred in languages else languages[0]
+    logger.warning(
+        "configured language %r is not supported by the MT provider; using %r",
+        code,
+        fallback,
+    )
+    return fallback
+
+
 class OverlayApp(QObject):
     """Owns the overlay windows, tray menu, hotkey, and WebSocket client."""
 
@@ -206,8 +221,13 @@ class OverlayApp(QObject):
         super().__init__()
         self._app = app
         self._config = config
-        self._source_lang = config.app.language.source
-        self._target_lang = config.app.language.target
+        self._languages = supported_languages(config.mt.provider)
+        self._source_lang = _supported_language(
+            config.app.language.source, self._languages, "en"
+        )
+        self._target_lang = _supported_language(
+            config.app.language.target, self._languages, "id"
+        )
         self._checkpoint_s = config.summary.checkpoint_interval_s
         self._region = config.screen.region
         self._state = SessionState.IDLE
@@ -220,6 +240,7 @@ class OverlayApp(QObject):
             source_lang=self._source_lang,
             target_lang=self._target_lang,
             checkpoint_interval_s=self._checkpoint_s,
+            languages=self._languages,
         )
         self._caption.set_region(self._region)
         self._history = HistoryWindow(config.ui)

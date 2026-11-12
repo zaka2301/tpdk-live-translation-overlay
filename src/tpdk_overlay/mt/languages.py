@@ -42,6 +42,24 @@ ISO_TO_NLLB: dict[str, str] = {
 
 _NLLB_CODES = frozenset(ISO_TO_NLLB.values())
 
+# PLaMo-3-Translate language codes (53 languages, from the model card). Most
+# ISO 639-1 codes pass through; the model distinguishes Chinese variants and
+# calls Tagalog ``tl``.
+PLAMO_LANGUAGE_CODES: frozenset[str] = frozenset(
+    {
+        "ar", "az", "be", "bg", "bn", "ca", "ceb", "de", "en", "es", "et",
+        "eu", "fa", "fr", "gu", "he", "hi", "hr", "hu", "hy", "id", "it",
+        "ja", "jv", "ka", "kk", "km", "ko", "lt", "lv", "ml", "mr", "ms",
+        "my", "ne", "nl", "pa", "pl", "ru", "si", "sk", "sl", "sr", "sw",
+        "ta", "te", "th", "tl", "ur", "uz", "vi", "zh-hans", "zh-hant",
+    }
+)
+
+_PLAMO_ALIASES: dict[str, str] = {
+    "zh": "zh-hans",  # project default for Chinese; zh-hant stays explicit
+    "fil": "tl",
+}
+
 
 def to_nllb(code: str) -> str:
     """Return the NLLB-200 code for an ISO 639-1 code or an NLLB code.
@@ -64,4 +82,42 @@ def to_nllb(code: str) -> str:
         ) from None
 
 
-__all__ = ["ISO_TO_NLLB", "to_nllb"]
+def to_plamo(code: str) -> str:
+    """Return the PLaMo-3-Translate language code for a public language tag.
+
+    ``zh`` maps to Simplified Chinese (``zh-hans``) and ``fil`` to ``tl``;
+    everything else is matched case-insensitively against the model's codes.
+    Raises ``ValueError`` for an empty or unsupported code.
+    """
+
+    normalized = code.strip().lower().replace("_", "-")
+    if not normalized:
+        raise ValueError("language code is empty")
+    normalized = _PLAMO_ALIASES.get(normalized, normalized)
+    if normalized in PLAMO_LANGUAGE_CODES:
+        return normalized
+    supported = ", ".join(sorted(PLAMO_LANGUAGE_CODES))
+    raise ValueError(
+        f"unsupported PLaMo language code {code!r}; supported codes: {supported}"
+    )
+
+
+def supported_languages(provider: str) -> list[str]:
+    """Return the public language codes the configured MT provider accepts.
+
+    The overlay builds its From/To menus from this list, so every returned code
+    must round-trip through that provider's adapter.
+    """
+
+    if provider == "plamo_llama":
+        return sorted(PLAMO_LANGUAGE_CODES)
+    return sorted(ISO_TO_NLLB)
+
+
+__all__ = [
+    "ISO_TO_NLLB",
+    "PLAMO_LANGUAGE_CODES",
+    "supported_languages",
+    "to_nllb",
+    "to_plamo",
+]
