@@ -37,6 +37,7 @@ class _FakeOverlay:
         self._state = SessionState.IDLE
         self._session_id: str | None = None
         self._caption = _Caption()
+        self._caption_capture_hidden = False
         self._history = _History()
         self.started = 0
 

@@ -10,7 +10,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
+from types import SimpleNamespace
+from typing import Any
 
+import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -269,7 +273,10 @@ def _orchestrator_stub() -> Orchestrator:
     orchestrator._capture_ack_lock = threading.Lock()
     orchestrator._capture_ack_waiters = {}
     orchestrator._metrics = None
+    orchestrator._session = None
     orchestrator._stop_event = threading.Event()
+    orchestrator._recent_frame_rects = deque(maxlen=2)
+    orchestrator._caption_rect = None
     return orchestrator
 
 
@@ -308,6 +315,219 @@ def test_hide_request_is_acked_without_an_ocr_window() -> None:
 
     assert len(host.sent) == 1
     assert host.sent[0].event_id == hide.event_id
+
+
+def test_capture_guard_hides_the_caption_and_the_ocr_overlay() -> None:
+    orchestrator = _orchestrator_stub()
+    published: list[OverlayVisibilityEvent] = []
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    def capture(region: ScreenRegion) -> Any:
+        return image
+
+    def publish(event: OverlayVisibilityEvent) -> None:
+        published.append(event)
+        if not event.visible:
+            orchestrator.record_render_ack(event.event_id, 0)
+
+    orchestrator._publish = publish
+    ports = SimpleNamespace(screen_source=SimpleNamespace(capture=capture))
+    region = ScreenRegion(left=0, top=0, width=4, height=4)
+
+    assert orchestrator._capture_with_overlay_hidden(region, ports) is image
+    assert [(event.target, event.visible) for event in published] == [
+        ("ocr", False),
+        ("caption", False),
+        ("ocr", True),
+        ("caption", True),
+    ]
+
+
+def test_capture_guard_restores_windows_when_an_ack_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tpdk_overlay.pipeline.orchestrator._CAPTURE_HIDE_TIMEOUT_S", 0.05
+    )
+    orchestrator = _orchestrator_stub()
+    published: list[OverlayVisibilityEvent] = []
+
+    def publish(event: OverlayVisibilityEvent) -> None:
+        published.append(event)
+        if not event.visible and event.target == "ocr":
+            # The caption ack is dropped (e.g. a saturated UI outbox); the
+            # caption may already be hidden, so it still needs the show.
+            orchestrator.record_render_ack(event.event_id, 0)
+
+    orchestrator._publish = publish
+    ports = SimpleNamespace(
+        screen_source=SimpleNamespace(capture=lambda region: None)
+    )
+    region = ScreenRegion(left=0, top=0, width=4, height=4)
+
+    assert orchestrator._capture_with_overlay_hidden(region, ports) is None
+    assert [(event.target, event.visible) for event in published if event.visible] == [
+        ("ocr", True),
+        ("caption", True),
+    ]
+
+
+def test_caption_rect_is_masked_inside_the_region() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._config = SimpleNamespace(
+        screen=SimpleNamespace(hide_overlay_during_capture=True)
+    )
+    orchestrator.record_render_ack(
+        "ack-caption",
+        0,
+        ScreenRegion(left=100, top=600, width=400, height=100),
+    )
+    region = ScreenRegion(left=50, top=500, width=600, height=300)
+
+    assert orchestrator._capture_mask(region) == (BBox(x=50, y=100, w=400, h=100),)
+
+
+def test_hiding_the_caption_drops_its_mask() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._overlay_visibility = {"ocr": True, "caption": True}
+    orchestrator._caption_rect = ScreenRegion(left=0, top=0, width=100, height=50)
+
+    orchestrator.set_overlay_visibility("caption", False)
+
+    assert orchestrator._caption_rect is None
+
+
+def test_caption_mask_outside_the_region_is_ignored() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._config = SimpleNamespace(
+        screen=SimpleNamespace(hide_overlay_during_capture=True)
+    )
+    orchestrator.record_render_ack(
+        "ack-caption",
+        0,
+        ScreenRegion(left=2000, top=1200, width=400, height=100),
+    )
+    region = ScreenRegion(left=0, top=0, width=1280, height=720)
+
+    assert orchestrator._capture_mask(region) == ()
+
+
+class _CaptionHost:
+    """Binds the app's caption capture-visibility handler to a real window."""
+
+    _on_overlay_visibility = OverlayApp._on_overlay_visibility
+    _hide_caption_for_capture = OverlayApp._hide_caption_for_capture
+    _flush_pending_final_acks = OverlayApp._flush_pending_final_acks
+
+    def __init__(self, caption: CaptionWindow, region: ScreenRegion) -> None:
+        self._caption = caption
+        self._caption_capture_hidden = False
+        self._region = region
+        self._pending_final_acks: list[str] = []
+        self.sent: list[object] = []
+
+    def _send(self, command: object) -> None:
+        self.sent.append(command)
+
+
+def test_caption_hides_for_capture_and_reports_its_rect(
+    qt_app: QApplication,
+) -> None:
+    caption = CaptionWindow(
+        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    caption.show()
+    qt_app.processEvents()
+    host = _CaptionHost(
+        caption, ScreenRegion(left=-10000, top=-10000, width=40000, height=40000)
+    )
+
+    hide = OverlayVisibilityEvent(target="caption", visible=False)
+    host._on_overlay_visibility(hide)
+
+    assert not caption.isVisible()
+    assert len(host.sent) == 1
+    ack = host.sent[0]
+    assert isinstance(ack, RenderAckCommand)
+    assert ack.event_id == hide.event_id
+    assert ack.caption_rect is not None
+    assert ack.caption_rect.width > 0 and ack.caption_rect.height > 0
+
+    host._on_overlay_visibility(
+        OverlayVisibilityEvent(target="caption", visible=True)
+    )
+    assert caption.isVisible()
+    caption.close()
+
+
+def test_caption_stays_visible_when_it_is_outside_the_region(
+    qt_app: QApplication,
+) -> None:
+    caption = CaptionWindow(
+        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    caption.show()
+    qt_app.processEvents()
+    host = _CaptionHost(
+        caption, ScreenRegion(left=50000, top=50000, width=100, height=100)
+    )
+
+    host._on_overlay_visibility(
+        OverlayVisibilityEvent(target="caption", visible=False)
+    )
+
+    assert caption.isVisible()
+    assert host.sent[0].caption_rect is not None
+    caption.close()
+
+
+class _FinalAckHost(_CaptionHost):
+    """Adds the caption window's final-ack path to the visibility host."""
+
+    _ack = OverlayApp._ack
+
+
+def test_final_ack_waits_for_the_caption_to_come_back(
+    qt_app: QApplication,
+) -> None:
+    caption = CaptionWindow(
+        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+    )
+    caption.show()
+    qt_app.processEvents()
+    host = _FinalAckHost(
+        caption, ScreenRegion(left=-10000, top=-10000, width=40000, height=40000)
+    )
+    hide = OverlayVisibilityEvent(target="caption", visible=False)
+
+    host._on_overlay_visibility(hide)
+    host._ack(SimpleNamespace(event_id="final-1"))
+    assert host._pending_final_acks == ["final-1"]
+    assert all(
+        not isinstance(command, RenderAckCommand)
+        or command.event_id != "final-1"
+        for command in host.sent
+    )
+
+    host._on_overlay_visibility(
+        OverlayVisibilityEvent(target="caption", visible=True)
+    )
+    assert caption.isVisible()
+    assert [
+        command.event_id
+        for command in host.sent
+        if isinstance(command, RenderAckCommand)
+    ] == [hide.event_id, "final-1"]
+    caption.close()
 
 
 def test_capture_ack_aborts_on_stop() -> None:

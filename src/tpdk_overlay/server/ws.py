@@ -144,7 +144,11 @@ class ConnectionManager:
         elif isinstance(command, SummaryFinalRequestCommand):
             orchestrator.request_final_summary()
         elif isinstance(command, RenderAckCommand):
-            orchestrator.record_render_ack(command.event_id, command.painted_ts_ms)
+            orchestrator.record_render_ack(
+                command.event_id,
+                command.painted_ts_ms,
+                command.caption_rect,
+            )
         else:  # pragma: no cover - contract union is exhaustive
             logger.warning("unhandled command: %s", command.type)
 

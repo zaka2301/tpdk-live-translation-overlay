@@ -53,7 +53,12 @@ from tpdk_overlay.contracts import (
 )
 from tpdk_overlay.mt.languages import supported_languages
 from tpdk_overlay.ui import theme
-from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
+from tpdk_overlay.ui.caption import (
+    CaptionWindow,
+    HistoryWindow,
+    RegionPicker,
+    physical_rect_for,
+)
 from tpdk_overlay.ui.client import OverlayClient
 from tpdk_overlay.ui.ocr_overlay import OcrOverlayWindow
 from tpdk_overlay.utils.clock import now_ms
@@ -62,6 +67,19 @@ from tpdk_overlay.utils.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 WM_HOTKEY = 0x0312
+
+
+def _overlaps(region: ScreenRegion | None, rect: ScreenRegion | None) -> bool:
+    """True when two physical-pixel rectangles intersect."""
+
+    if region is None or rect is None:
+        return False
+    return (
+        rect.left < region.left + region.width
+        and rect.left + rect.width > region.left
+        and rect.top < region.top + region.height
+        and rect.top + rect.height > region.top
+    )
 WM_QUIT = 0x0012
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -261,6 +279,10 @@ class OverlayApp(QObject):
             else None
         )
         self._ocr_capture_hidden = False
+        self._caption_capture_hidden = False
+        # Finals painted while the caption is hidden for a grab; their render
+        # acks are sent once the window is back so metrics keeps the row.
+        self._pending_final_acks: list[str] = []
         self._ocr_visible = True
 
         self._client = OverlayClient(
@@ -451,15 +473,18 @@ class OverlayApp(QObject):
         )
 
     def _on_overlay_visibility(self, event: OverlayVisibilityEvent) -> None:
-        """Hide/show the OCR overlay around the backend's screen grab.
+        """Hide/show a UI window around the backend's screen grab.
 
-        Recording mode keeps the overlay out of the display affinity so OBS and
-        screen shares capture it; the OCR loop therefore hides it for the few
-        frames it grabs. The ack tells the backend the window is off screen,
+        Recording mode keeps both windows out of the display affinity so OBS and
+        screen shares capture them; the OCR loop therefore hides them for the
+        few frames it grabs. The ack tells the backend the window is off screen,
         and the UI restores the user's own visibility state afterwards.
         """
 
         if event.reason != "capture":
+            return
+        if event.target == "caption":
+            self._hide_caption_for_capture(event)
             return
         if event.visible:
             if self._ocr is not None and self._ocr_capture_hidden:
@@ -477,6 +502,38 @@ class OverlayApp(QObject):
             RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
         )
 
+    def _hide_caption_for_capture(self, event: OverlayVisibilityEvent) -> None:
+        """Hide the caption for a grab; the ack reports where it sits.
+
+        The caption is capturable in recording mode, so an OCR grab that
+        overlaps it would read the transcript back as slide text. The window is
+        only hidden when it overlaps the captured region, and the ack carries
+        its physical rect so the backend can mask it out of the slide-change
+        score while it is visible between grabs.
+        """
+
+        if event.visible:
+            if self._caption_capture_hidden:
+                self._caption_capture_hidden = False
+                self._caption.show()
+                self._flush_pending_final_acks()
+                self._flush_pending_final_acks()
+            return
+        was_visible = self._caption.isVisible()
+        rect = physical_rect_for(self._caption) if was_visible else None
+        self._caption_capture_hidden = bool(
+            was_visible and _overlaps(self._region, rect)
+        )
+        if self._caption_capture_hidden:
+            self._caption.hide()
+        self._send(
+            RenderAckCommand(
+                event_id=event.event_id,
+                painted_ts_ms=now_ms(),
+                caption_rect=rect,
+            )
+        )
+
     def _on_session_state(self, event: SessionStateEvent) -> None:
         self._state = event.state
         if event.session_id and event.session_id != self._session_id:
@@ -491,6 +548,10 @@ class OverlayApp(QObject):
             if ocr is not None:
                 ocr.clear()
             self._ocr_capture_hidden = False
+            if self._caption_capture_hidden:
+                self._caption_capture_hidden = False
+                self._caption.show()
+                self._flush_pending_final_acks()
         self._caption.set_session_state(event.state)
         self._update_actions()
         self._maybe_auto_start(event.state)
@@ -509,11 +570,25 @@ class OverlayApp(QObject):
         """Report the paint time for NFR-01 when a final was actually shown."""
 
         if not self._caption.isVisible():
+            if self._caption_capture_hidden:
+                # A capture grab hid the caption; report once it is back so the
+                # metrics row is not lost to the ~100 ms window.
+                self._pending_final_acks.append(event.event_id)
             return
         self._caption.paint_now()
         self._send(
             RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
         )
+
+    def _flush_pending_final_acks(self) -> None:
+        """Acknowledge finals that landed while the caption was grab-hidden."""
+
+        pending, self._pending_final_acks = self._pending_final_acks, []
+        if not pending or not self._caption.isVisible():
+            return
+        self._caption.paint_now()
+        for event_id in pending:
+            self._send(RenderAckCommand(event_id=event_id, painted_ts_ms=now_ms()))
 
     def _on_connected(self) -> None:
         self._caption.set_connection(True)
@@ -532,6 +607,9 @@ class OverlayApp(QObject):
     # -- overlay toggles ---------------------------------------------------
 
     def _set_caption_visible(self, visible: bool) -> None:
+        if not visible:
+            # Finals queued during a grab were never shown; drop their acks.
+            self._pending_final_acks.clear()
         self._caption.setVisible(visible)
         if visible:
             self._caption.raise_()

@@ -190,11 +190,12 @@ class OverlayVisibilityEvent(Event):
     """Transient overlay hide/show around a screen grab (recording mode).
 
     ``reason == "capture"`` distinguishes this from the user's tray toggle: the
-    UI hides the OCR overlay, acknowledges with ``RenderAckCommand`` once the
-    window is off the compositor, and restores its own visibility afterwards.
-    The backend only sends it when ``screen.hide_overlay_during_capture`` is on,
-    so the overlay stays visible to OBS/screen shares and the OCR loop still
-    grabs clean pixels.
+    UI hides the addressed overlay (the OCR overlay, or the caption when it
+    overlaps the captured region), acknowledges with ``RenderAckCommand`` once
+    the window is off the compositor, and restores its own visibility
+    afterwards. The backend only sends it when
+    ``screen.hide_overlay_during_capture`` is on, so the overlays stay visible to
+    OBS/screen shares and the OCR loop still grabs clean pixels.
     """
 
     type: Literal["overlay.visibility"] = "overlay.visibility"
@@ -305,11 +306,18 @@ class SummaryFinalRequestCommand(Command):
 
 
 class RenderAckCommand(Command):
-    """UI reports when it painted an event; closes the NFR-01 end-to-end loop."""
+    """UI reports when it painted an event; closes the NFR-01 end-to-end loop.
+
+    ``caption_rect`` rides along with the caption hide acknowledgement of a
+    capture guard: it is the caption window's physical rect, which the backend
+    masks out of the slide-change score so a caption repaint never looks like a
+    new slide. Other acks leave it unset.
+    """
 
     type: Literal["render.ack"] = "render.ack"
     event_id: str
     painted_ts_ms: int
+    caption_rect: ScreenRegion | None = None
 
 
 class PingCommand(Command):

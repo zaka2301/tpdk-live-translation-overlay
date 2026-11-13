@@ -290,7 +290,22 @@ def _recv(ws: Any, timeout: float = 5.0) -> dict[str, Any]:
     kind, value = box.get(timeout=timeout)
     if kind == "error":
         raise value
-    return json.loads(value)
+    message = json.loads(value)
+    if message.get("type") == "overlay.visibility" and not message.get(
+        "visible", True
+    ):
+        # The real overlay window acknowledges a capture hide before the
+        # backend grabs; without it the OCR loop correctly skips the pass.
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "render.ack",
+                    "event_id": message["event_id"],
+                    "painted_ts_ms": message["ts_ms"],
+                }
+            )
+        )
+    return message
 
 
 def _wait_for(

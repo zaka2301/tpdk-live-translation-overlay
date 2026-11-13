@@ -1319,6 +1319,38 @@ def _mss_monitors() -> tuple[dict[str, int], ...]:
         return ()
 
 
+def physical_rect_for(window: QWidget) -> ScreenRegion | None:
+    """Physical-pixel rect of a top-level window on the virtual desktop.
+
+    The backend needs it to mask the window out of the slide-change score: Qt
+    geometry is logical, mss captures physical pixels, and monitors can have
+    different scales, so the origin is matched against the mss monitors like
+    the region picker does.
+    """
+
+    geometry = window.frameGeometry()
+    screen = QGuiApplication.screenAt(geometry.center()) or window.screen()
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return None
+    dpr = screen.devicePixelRatio() or 1.0
+    local = geometry.topLeft() - screen.geometry().topLeft()
+    origin = _physical_origin(screen)
+    if origin is not None:
+        left = origin[0] + round(local.x() * dpr)
+        top = origin[1] + round(local.y() * dpr)
+    else:
+        left = round((screen.geometry().x() + local.x()) * dpr)
+        top = round((screen.geometry().y() + local.y()) * dpr)
+    return ScreenRegion(
+        left=left,
+        top=top,
+        width=max(1, round(geometry.width() * dpr)),
+        height=max(1, round(geometry.height() * dpr)),
+    )
+
+
 def _physical_origin(screen: object) -> tuple[int, int] | None:
     """Physical origin of a Qt screen, matched by size against mss monitors."""
 
@@ -1512,4 +1544,5 @@ __all__ = [
     "RegionPicker",
     "format_timestamp",
     "language_label",
+    "physical_rect_for",
 ]
