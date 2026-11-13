@@ -52,6 +52,7 @@ from tpdk_overlay.contracts import (
     TranslationStatus,
 )
 from tpdk_overlay.mt.languages import supported_languages
+from tpdk_overlay.ui import theme
 from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
 from tpdk_overlay.ui.client import OverlayClient
 from tpdk_overlay.ui.ocr_overlay import OcrOverlayWindow
@@ -193,11 +194,11 @@ def _app_icon() -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#4cc2ff"))
-    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
-    painter.setBrush(QColor("#04121b"))
-    painter.drawRoundedRect(14, 22, 36, 7, 3, 3)
-    painter.drawRoundedRect(14, 35, 26, 7, 3, 3)
+    painter.setBrush(QColor(theme.ACCENT))
+    painter.drawRoundedRect(4, 4, 56, 56, 8, 8)
+    painter.setBrush(QColor(theme.ACCENT_TEXT))
+    painter.drawRoundedRect(14, 22, 36, 7, 2, 2)
+    painter.drawRoundedRect(14, 35, 26, 7, 2, 2)
     painter.end()
     return QIcon(pixmap)
 

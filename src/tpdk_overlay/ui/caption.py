@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 MIN_WIDTH = 480
 MIN_HEIGHT = 150
-PANEL_RADIUS = 16.0
+PANEL_RADIUS = 6.0
 GRIP_SIZE = 18
 SCREEN_MARGIN = 48
 
@@ -386,9 +386,12 @@ class CaptionWindow(QWidget):
 
         self._controls = QWidget(self)
         self._controls.setObjectName("controlBar")
+        # A plain QWidget only paints a stylesheet background with this flag;
+        # the bar is solid so its labels stay readable over bright video.
+        self._controls.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._controls.setStyleSheet(theme.controls_qss(family, caption.font_size))
         row = QHBoxLayout(self._controls)
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(6, 5, 6, 5)
         row.setSpacing(6)
 
         self._start_button = QPushButton("Start", self._controls)
@@ -521,11 +524,25 @@ class CaptionWindow(QWidget):
         self._translation_label.setStyleSheet(f"color: {theme.TRANSLATION_TEXT};")
         layout.addWidget(self._translation_label, 1)
 
-        self._status_label = QLabel("", self)
+        # The status line sits on a small solid chip: the caption body is
+        # translucent by design, so bare muted text would take the panel's own
+        # color over bright video and disappear.
+        self._status_bar = QWidget(self)
+        self._status_bar.setObjectName("statusBar")
+        self._status_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._status_bar.setStyleSheet(
+            f"QWidget#statusBar {{ background: {theme.CONTROL_BG};"
+            " border-radius: 3px; }"
+        )
+        status_row = QHBoxLayout(self._status_bar)
+        status_row.setContentsMargins(6, 2, 6, 2)
+        status_row.setSpacing(0)
+        self._status_label = CaptionLabel("", self._status_bar)
         self._status_label.setTextFormat(Qt.TextFormat.PlainText)
         self._status_label.setFont(theme.font(family, max(9, caption.font_size - 10)))
         self._status_label.setStyleSheet(f"color: {theme.STATUS_TEXT};")
-        layout.addWidget(self._status_label)
+        status_row.addWidget(self._status_label)
+        layout.addWidget(self._status_bar, 0, Qt.AlignmentFlag.AlignLeft)
 
         self._grip = _Grip(self)
         self._refresh_status()

@@ -125,8 +125,8 @@ ui:
     exclude_from_capture: true
   ocr_overlay:
     enabled: true
-    background: "#101418"
-    opacity: 0.70          # near-opaque: source text must not ghost through
+    background: "#101010"  # neutral graphite, matches ui/theme.py
+    opacity: 0.70          # translucent: the original text stays visible
     font_family: Segoe UI
     font_scale: 0.9        # multiplier on the size derived from the source line
     max_font_px: 96        # guard against absurd heights from merged blocks

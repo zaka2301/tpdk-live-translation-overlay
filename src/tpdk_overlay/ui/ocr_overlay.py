@@ -442,12 +442,9 @@ class OcrOverlayWindow(QWidget):
         # Panels first, text last: a panel that grew past its source box must
         # not hide a neighbouring block's translation.
         for _block, layout in layouts:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 45))
-            painter.drawRoundedRect(layout.panel.adjusted(-1, 1, 1, 3), 5, 5)
             painter.setPen(QPen(border, 1))
             painter.setBrush(background)
-            painter.drawRoundedRect(layout.panel.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+            painter.drawRoundedRect(layout.panel.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
 
         if not self._click_through:
             # An invisible block must stay findable to toggle it back; draw the
@@ -462,15 +459,18 @@ class OcrOverlayWindow(QWidget):
 
         for block, layout in layouts:
             painter.setFont(layout.font)
+            target = layout.panel.adjusted(_PAD_X, _PAD_Y, -_PAD_X, -_PAD_Y)
             if block.translation_status is TranslationStatus.FAILED:
-                painter.setPen(QColor(theme.WARNING))
+                color = QColor(theme.WARNING)
             else:
-                painter.setPen(QColor(theme.TRANSLATION_TEXT))
-            painter.drawText(
-                layout.panel.adjusted(_PAD_X, _PAD_Y, -_PAD_X, -_PAD_Y),
-                _TEXT_FLAGS,
-                layout.text,
-            )
+                color = QColor(theme.TRANSLATION_TEXT)
+            # The panel is translucent on purpose (the source text stays
+            # visible), so the translation carries a 1 px shadow to stay the
+            # dominant text instead of blending into the original.
+            painter.setPen(QColor(0, 0, 0, 170))
+            painter.drawText(target.adjusted(1, 1, 1, 1), _TEXT_FLAGS, layout.text)
+            painter.setPen(color)
+            painter.drawText(target, _TEXT_FLAGS, layout.text)
 
 
 __all__ = [

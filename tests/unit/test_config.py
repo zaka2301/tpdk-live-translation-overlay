@@ -18,7 +18,7 @@ def test_default_config_loads() -> None:
     assert config.asr.llama_cpp.max_new_tokens == 128
     assert config.asr.llama_cpp.partial_interval_ms == 3000
     assert config.audio.vad.max_utterance_ms == 12_000
-    assert config.ui.caption.opacity == 0.65
+    assert config.ui.caption.opacity == 0.45
     assert config.ui.caption.height == 300
     assert config.asr.llama_cpp.partial_tail_sec == 0.0
     assert config.asr.llama_cpp.min_energy_dbfs == -40.0

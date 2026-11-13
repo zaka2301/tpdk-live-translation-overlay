@@ -10,30 +10,32 @@ from __future__ import annotations
 
 from PySide6.QtGui import QColor, QFont
 
-# Panel and text palette. The caption panel uses ``BACKGROUND`` at
-# ``CaptionConfig.opacity``; text stays fully opaque so it reads cleanly over
-# translucent video.
-BACKGROUND = "#0b1017"
-BORDER = "#2c3d4f"
-SOURCE_TEXT = "#c6d5e3"
-TRANSLATION_TEXT = "#f3f8fd"
-STATUS_TEXT = "#8497a9"
-ACCENT = "#4cc2ff"
-ACCENT_HOVER = "#6fd0ff"
-PREVIEW_ADDED = "#7ee787"
-WARNING = "#ffb454"
-ERROR = "#ff6b6b"
+# Panel and text palette. Neutral graphite, no tinted chrome: the overlay is
+# readable over video without looking like a colored widget. Saturated colors
+# are reserved for meaning (preview deltas, warnings, errors). The caption panel
+# uses ``BACKGROUND`` at ``CaptionConfig.opacity``; text stays fully opaque.
+BACKGROUND = "#101010"
+BORDER = "#2e2e2e"
+SOURCE_TEXT = "#a8a8a8"
+TRANSLATION_TEXT = "#f2f2f2"
+STATUS_TEXT = "#8a8a8a"
+ACCENT = "#e8e8e8"
+ACCENT_HOVER = "#ffffff"
+ACCENT_TEXT = "#0c0c0c"
+PREVIEW_ADDED = "#8fbc8f"
+WARNING = "#d9a441"
+ERROR = "#d97a6c"
 
 # Control surfaces (only visible while click-through is off).
-CONTROL_BG = "#15202b"
-CONTROL_HOVER = "#22303f"
-CONTROL_PRESSED = "#2d3f52"
-CONTROL_TEXT = "#dbe6f0"
+CONTROL_BG = "#1a1a1a"
+CONTROL_HOVER = "#262626"
+CONTROL_PRESSED = "#303030"
+CONTROL_TEXT = "#e6e6e6"
 
 # History window.
-HISTORY_BG = "#0d131a"
-HISTORY_TEXT = "#dbe6f0"
-HISTORY_MUTED = "#7f93a6"
+HISTORY_BG = "#121212"
+HISTORY_TEXT = "#e6e6e6"
+HISTORY_MUTED = "#8a8a8a"
 
 
 def rgba(color: str, alpha: float) -> str:
@@ -66,10 +68,12 @@ def controls_qss(family: str, size: int) -> str:
     control = max(9, size - 6)
     return f"""
     QWidget#controlBar {{
-        background: transparent;
+        background: {BACKGROUND};
+        border: 1px solid {BORDER};
+        border-radius: 4px;
     }}
     QWidget#controlBar QLabel {{
-        color: {STATUS_TEXT};
+        color: {SOURCE_TEXT};
         font-family: '{family}';
         font-size: {small}pt;
         background: transparent;
@@ -78,7 +82,7 @@ def controls_qss(family: str, size: int) -> str:
         color: {CONTROL_TEXT};
         background: {CONTROL_BG};
         border: 1px solid {BORDER};
-        border-radius: 7px;
+        border-radius: 3px;
         padding: 4px 10px;
         font-family: '{family}';
         font-size: {control}pt;
@@ -94,7 +98,7 @@ def controls_qss(family: str, size: int) -> str:
         background: transparent;
     }}
     QWidget#controlBar QPushButton#primaryButton {{
-        color: #04121b;
+        color: {ACCENT_TEXT};
         background: {ACCENT};
         border: none;
         font-weight: 600;
@@ -107,7 +111,7 @@ def controls_qss(family: str, size: int) -> str:
         color: {CONTROL_TEXT};
         background: {CONTROL_BG};
         border: 1px solid {BORDER};
-        border-radius: 7px;
+        border-radius: 3px;
         padding: 3px 8px;
         font-family: '{family}';
         font-size: {control}pt;
@@ -133,7 +137,7 @@ def history_window_qss(family: str, size: int) -> str:
     QTextBrowser {{
         background: {HISTORY_BG};
         border: 1px solid {BORDER};
-        border-radius: 8px;
+        border-radius: 4px;
         padding: 10px;
         selection-background-color: {CONTROL_HOVER};
     }}
@@ -148,7 +152,7 @@ def history_window_qss(family: str, size: int) -> str:
         color: {CONTROL_TEXT};
         background: {CONTROL_BG};
         border: 1px solid {BORDER};
-        border-radius: 7px;
+        border-radius: 3px;
         padding: 5px 14px;
         font-family: '{family}';
         font-size: {max(9, size)}pt;
@@ -176,6 +180,7 @@ def notice_color(level: str) -> str:
 __all__ = [
     "ACCENT",
     "ACCENT_HOVER",
+    "ACCENT_TEXT",
     "BACKGROUND",
     "BORDER",
     "CONTROL_BG",
