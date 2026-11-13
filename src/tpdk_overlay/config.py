@@ -218,9 +218,11 @@ class CaptionConfig(_Section):
 class OcrOverlayConfig(_Section):
     enabled: bool = True
     background: str = "#101418"
-    opacity: float = Field(default=0.92, ge=0.0, le=1.0)
+    opacity: float = Field(default=0.97, ge=0.0, le=1.0)
     font_family: str = "Segoe UI"
-    font_size: int = Field(default=14, gt=0)
+    # Translations are sized from the source line height; this multiplies it.
+    font_scale: float = Field(default=1.0, ge=0.4, le=2.5)
+    max_font_px: int = Field(default=96, gt=0)
 
 
 class UiConfig(_Section):

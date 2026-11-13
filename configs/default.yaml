@@ -115,7 +115,7 @@ ui:
     width: 1200
     height: 300           # fits ~3-4 translation lines at the default font
     anchor: bottom-center
-    opacity: 0.65
+    opacity: 0.45
     font_family: Segoe UI
     font_size: 18
     translation_font_size: 18
@@ -126,8 +126,9 @@ ui:
   ocr_overlay:
     enabled: true
     background: "#101418"
-    opacity: 0.40
+    opacity: 0.70          # near-opaque: source text must not ghost through
     font_family: Segoe UI
-    font_size: 18
+    font_scale: 0.9        # multiplier on the size derived from the source line
+    max_font_px: 96        # guard against absurd heights from merged blocks
   click_through: true
   auto_start: true        # start the session as soon as the overlay connects

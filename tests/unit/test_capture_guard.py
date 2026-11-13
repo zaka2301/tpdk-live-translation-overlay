@@ -161,7 +161,7 @@ def test_windows_are_excluded_when_shown(
     qt_app.processEvents()
     caption.close()
 
-    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10))
+    overlay = OcrOverlayWindow(OcrOverlayConfig())
     overlay.show_frame(_frame())
     qt_app.processEvents()
     overlay.close()
@@ -212,7 +212,7 @@ class _VisibilityHost:
 
 
 def test_capture_hide_acks_then_restores_the_overlay(qt_app: QApplication) -> None:
-    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay = OcrOverlayWindow(OcrOverlayConfig(), capture_excluded=False)
     overlay.show_frame(_frame())
     qt_app.processEvents()
     assert overlay.isVisible()
@@ -234,7 +234,7 @@ def test_capture_hide_acks_then_restores_the_overlay(qt_app: QApplication) -> No
 def test_capture_show_keeps_a_user_hidden_overlay_hidden(
     qt_app: QApplication,
 ) -> None:
-    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay = OcrOverlayWindow(OcrOverlayConfig(), capture_excluded=False)
     overlay.show_frame(_frame())
     overlay.set_overlay_visible(False)
     host = _VisibilityHost(overlay)
@@ -256,7 +256,7 @@ def test_recording_mode_leaves_the_overlay_capturable(
         "tpdk_overlay.ui.ocr_overlay.exclude_from_capture",
         lambda widget: seen.append(type(widget).__name__) or True,
     )
-    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay = OcrOverlayWindow(OcrOverlayConfig(), capture_excluded=False)
     overlay.show_frame(_frame())
     qt_app.processEvents()
     overlay.close()

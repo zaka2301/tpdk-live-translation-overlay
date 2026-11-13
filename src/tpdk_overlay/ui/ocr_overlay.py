@@ -14,6 +14,9 @@ at paint time (which also absorbs integer rounding at fractional DPIs).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
@@ -24,8 +27,14 @@ from tpdk_overlay.ui import theme
 from tpdk_overlay.ui.caption import _physical_origin
 from tpdk_overlay.ui.capture_guard import exclude_from_capture
 
-_PADDING_PX = 3
-_MIN_FONT_PT = 6
+# PaddleOCR boxes hug the text line: the detected polygon is ~1.1x the source em
+# tall (measured on rendered Segoe UI at 48 px: 1.02-1.21 across sample lines).
+# Dividing the per-line box height by this reproduces the source text size.
+_POLYGON_PER_EM = 1.10
+_MIN_FONT_PX = 10
+_PAD_X = 4
+_PAD_Y = 3
+_TEXT_MEASURE_HEIGHT = 100_000
 _TEXT_FLAGS = (
     Qt.AlignmentFlag.AlignLeft
     | Qt.AlignmentFlag.AlignVCenter
@@ -55,6 +64,146 @@ def region_logical_geometry(region: ScreenRegion) -> QRect:
     width = max(1, round(region.width / dpr))
     height = max(1, round(region.height / dpr))
     return QRect(x, y, width, height)
+
+
+@dataclass(frozen=True)
+class BlockLayout:
+    """Panel geometry and font for one translated block."""
+
+    panel: QRectF
+    font: QFont
+    text: str
+
+
+def _pixel_font(family: str, px: int) -> QFont:
+    font = QFont(family)
+    font.setPixelSize(max(1, int(px)))
+    return font
+
+
+def stabilize_line_heights(
+    values: Sequence[float], *, ratio: float = 1.25
+) -> list[float]:
+    """Return cluster medians so descender-less lines do not render smaller.
+
+    PaddleOCR boxes follow the glyphs present: a line with ``g``/``y``/``p``
+    reports a taller box than one without, for the same source font. Blocks
+    whose heights are within ``ratio`` share the cluster median, while
+    genuinely different sizes (a title over body text) stay separate.
+    """
+
+    order = sorted(range(len(values)), key=values.__getitem__)
+    result = [0.0] * len(values)
+    cluster: list[int] = []
+
+    def flush() -> None:
+        if not cluster:
+            return
+        cluster_values = sorted(values[index] for index in cluster)
+        median = cluster_values[len(cluster_values) // 2]
+        for index in cluster:
+            result[index] = median
+
+    for index in order:
+        if cluster and values[index] > values[cluster[-1]] * ratio:
+            flush()
+            cluster.clear()
+        cluster.append(index)
+    flush()
+    return result
+
+
+def block_right_limits(
+    rects: Sequence[QRectF], *, window_width: float
+) -> list[float]:
+    """Right-edge limit per block: the window edge or the next block beside it.
+
+    A panel may widen past its source box to keep a translation on one line, but
+    it must stop at a block in another column at the same height instead of
+    running over that column's own translation.
+    """
+
+    limits: list[float] = []
+    for index, rect in enumerate(rects):
+        limit = window_width
+        for other_index, other in enumerate(rects):
+            if other_index == index or other.x() <= rect.x():
+                continue
+            if other.top() < rect.bottom() and other.bottom() > rect.top():
+                limit = min(limit, other.x() - _PAD_X)
+        limits.append(limit)
+    return limits
+
+
+def layout_block(
+    block: OcrBlock,
+    rect: QRectF,
+    *,
+    config: OcrOverlayConfig,
+    window_height: float,
+    window_width: float,
+    line_height: float | None = None,
+    right_limit: float | None = None,
+) -> BlockLayout:
+    """Size a translation like the source line and fit it without shrinking.
+
+    ``rect`` is the source block box in widget coordinates. The source em is
+    recovered from the per-line box height (``bbox.h / line_count``), so a body
+    line on a 1280x720 slide renders at the size the lecturer used instead of a
+    fixed point size. The panel first widens to the right (slides usually have
+    free space there) so the text keeps the source line count, and only grows
+    taller when the window edge is reached. The font shrinks only when the
+    panel could no longer fit inside the window.
+    """
+
+    text = block.translation or block.text
+    per_block = rect.height() / max(1, block.line_count)
+    line_height = max(1.0, line_height if line_height is not None else per_block)
+    base_px = round(line_height / _POLYGON_PER_EM * config.font_scale)
+    base_px = max(_MIN_FONT_PX, min(int(config.max_font_px), int(base_px)))
+    source_inner = max(1, int(rect.width()) - 2 * _PAD_X)
+    edge = window_width if right_limit is None else min(window_width, right_limit)
+    window_inner = max(source_inner, int(edge - rect.x()) - 2 * _PAD_X)
+
+    def wrapped_height(font: QFont, width: int) -> int:
+        bounds = QFontMetrics(font).boundingRect(
+            QRect(0, 0, max(1, width), _TEXT_MEASURE_HEIGHT), _TEXT_FLAGS, text
+        )
+        return bounds.height() + 2 * _PAD_Y
+
+    def choose(px: int) -> tuple[QFont, int, int]:
+        font = _pixel_font(config.font_family, px)
+        # A translation may use as many lines as the source block had without
+        # growing the panel.
+        target = max(1, block.line_count) * QFontMetrics(font).height() + 2 * _PAD_Y
+        width = source_inner
+        needed = wrapped_height(font, width)
+        if needed > target:
+            low, high = source_inner, window_inner
+            best = -1
+            while low <= high:
+                mid = (low + high) // 2
+                if wrapped_height(font, mid) <= target:
+                    best = mid
+                    high = mid - 1
+                else:
+                    low = mid + 1
+            width = best if best > 0 else window_inner
+            needed = wrapped_height(font, width)
+        return font, width, needed
+
+    px = base_px
+    font, inner, needed = choose(px)
+    # A panel taller than the window would be clipped; shrink only then.
+    while needed > window_height and px > _MIN_FONT_PX:
+        px = max(_MIN_FONT_PX, int(px * 0.9))
+        font, inner, needed = choose(px)
+
+    height = max(rect.height(), float(needed))
+    top = rect.center().y() - height / 2.0
+    top = min(max(0.0, top), max(0.0, window_height - height))
+    panel = QRectF(rect.x(), top, float(inner + 2 * _PAD_X), height)
+    return BlockLayout(panel=panel, font=font, text=text)
 
 
 class OcrOverlayWindow(QWidget):
@@ -245,10 +394,12 @@ class OcrOverlayWindow(QWidget):
         background = QColor(self._config.background)
         background.setAlphaF(self._config.opacity)
         border = QColor(theme.BORDER)
-        border.setAlpha(150)
+        border.setAlpha(200)
         accent = QColor(theme.ACCENT)
-        accent.setAlpha(120)
+        accent.setAlpha(140)
 
+        visible: list[tuple[OcrBlock, QRectF]] = []
+        hidden_rects: list[QRectF] = []
         for block in frame.blocks:
             bbox = block.bbox
             rect = QRectF(
@@ -258,46 +409,75 @@ class OcrOverlayWindow(QWidget):
                 max(1.0, bbox.h * scale_y),
             )
             if block.block_id in self._hidden:
-                if not self._click_through:
-                    # An invisible block must stay findable to toggle it back.
-                    pen = QPen(accent)
-                    pen.setWidth(1)
-                    pen.setStyle(Qt.PenStyle.DashLine)
-                    painter.setPen(pen)
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+                hidden_rects.append(rect)
                 continue
+            visible.append((block, rect))
 
+        # One size per text-size cluster: PaddleOCR box heights wobble with the
+        # glyphs present, and neighbouring lines must not alternate sizes.
+        heights = stabilize_line_heights(
+            [rect.height() / max(1, block.line_count) for block, rect in visible]
+        )
+        limits = block_right_limits(
+            [rect for _block, rect in visible], window_width=float(self.width())
+        )
+        layouts = [
+            (
+                block,
+                layout_block(
+                    block,
+                    rect,
+                    config=self._config,
+                    window_height=float(self.height()),
+                    window_width=float(self.width()),
+                    line_height=line_height,
+                    right_limit=limit,
+                ),
+            )
+            for (block, rect), line_height, limit in zip(
+                visible, heights, limits, strict=True
+            )
+        ]
+
+        # Panels first, text last: a panel that grew past its source box must
+        # not hide a neighbouring block's translation.
+        for _block, layout in layouts:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 45))
+            painter.drawRoundedRect(layout.panel.adjusted(-1, 1, 1, 3), 5, 5)
             painter.setPen(QPen(border, 1))
             painter.setBrush(background)
-            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+            painter.drawRoundedRect(layout.panel.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
 
-            text = block.translation or block.text
-            if not text:
-                continue
-            inner = rect.adjusted(_PADDING_PX, 1, -_PADDING_PX, -1)
-            painter.setFont(self._fit_font(text, inner))
+        if not self._click_through:
+            # An invisible block must stay findable to toggle it back; draw the
+            # outline over the panels so a widened neighbour cannot hide it.
+            pen = QPen(accent)
+            pen.setWidth(1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for rect in hidden_rects:
+                painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+
+        for block, layout in layouts:
+            painter.setFont(layout.font)
             if block.translation_status is TranslationStatus.FAILED:
                 painter.setPen(QColor(theme.WARNING))
             else:
                 painter.setPen(QColor(theme.TRANSLATION_TEXT))
-            painter.drawText(inner, _TEXT_FLAGS, text)
-
-    def _fit_font(self, text: str, rect: QRectF) -> QFont:
-        """Largest font (down to the minimum) whose wrapped text fits the box."""
-
-        font = theme.font(self._config.font_family, self._config.font_size)
-        max_width = max(1, int(rect.width()))
-        max_height = max(1, int(rect.height()))
-        while font.pointSize() > _MIN_FONT_PT:
-            metrics = QFontMetrics(font)
-            bounds = metrics.boundingRect(
-                QRect(0, 0, max_width, 10_000), _TEXT_FLAGS, text
+            painter.drawText(
+                layout.panel.adjusted(_PAD_X, _PAD_Y, -_PAD_X, -_PAD_Y),
+                _TEXT_FLAGS,
+                layout.text,
             )
-            if bounds.height() <= max_height:
-                break
-            font.setPointSize(font.pointSize() - 1)
-        return font
 
 
-__all__ = ["OcrOverlayWindow", "region_logical_geometry"]
+__all__ = [
+    "BlockLayout",
+    "OcrOverlayWindow",
+    "block_right_limits",
+    "layout_block",
+    "region_logical_geometry",
+    "stabilize_line_heights",
+]
