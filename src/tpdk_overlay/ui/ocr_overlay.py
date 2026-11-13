@@ -22,6 +22,7 @@ from tpdk_overlay.config import OcrOverlayConfig
 from tpdk_overlay.contracts import OcrBlock, OcrFrameEvent, ScreenRegion, TranslationStatus
 from tpdk_overlay.ui import theme
 from tpdk_overlay.ui.caption import _physical_origin
+from tpdk_overlay.ui.capture_guard import exclude_from_capture
 
 _PADDING_PX = 3
 _MIN_FONT_PT = 6
@@ -206,6 +207,14 @@ class OcrOverlayWindow(QWidget):
 
     def is_block_visible(self, block_id: str) -> bool:
         return block_id not in self._hidden
+
+    def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        # The overlay covers the captured region. Exclude it from the grab so
+        # the OCR loop reads the slide, not its own translations. Re-assert on
+        # every show: a hidden/show cycle or a re-created handle would
+        # otherwise leave the fresh window capturable.
+        exclude_from_capture(self)
 
     def mousePressEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         if self._click_through or event.button() != Qt.MouseButton.LeftButton:

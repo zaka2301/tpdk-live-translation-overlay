@@ -205,6 +205,10 @@ class CaptionConfig(_Section):
     # Minimum time a translated final remains before the next segment may
     # replace it; the caption coalesces events while it is held.
     final_hold_ms: int = Field(default=2200, ge=0, le=10_000)
+    # Keep the caption out of screen captures/shares (it can overlap the slide
+    # region). Set false to record demos; an overlapping caption is then read
+    # back by OCR as slide text.
+    exclude_from_capture: bool = True
 
 
 class OcrOverlayConfig(_Section):

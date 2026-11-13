@@ -63,6 +63,7 @@ from tpdk_overlay.contracts import (
 )
 from tpdk_overlay.mt.languages import ISO_TO_NLLB
 from tpdk_overlay.ui import theme
+from tpdk_overlay.ui.capture_guard import exclude_from_capture
 
 logger = logging.getLogger(__name__)
 
@@ -990,6 +991,10 @@ class CaptionWindow(QWidget):
 
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
+        # The caption can overlap the captured slide region; keep it out of the
+        # OCR grabs (and screen shares) without hiding it from the user.
+        if self._caption.exclude_from_capture:
+            exclude_from_capture(self)
         # Re-fit after a hidden window is shown; show() is not guaranteed to
         # emit resizeEvent when the geometry did not change.
         self._apply_previous_text()
@@ -1401,6 +1406,9 @@ class RegionPicker(QWidget):
 
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
+        # The picker dims the whole desktop; a running session must keep
+        # grabbing the slide underneath rather than the dim overlay.
+        exclude_from_capture(self)
         self.activateWindow()
         self.setFocus()
 

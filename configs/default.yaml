@@ -116,6 +116,9 @@ ui:
     font_size: 18
     translation_font_size: 18
     final_hold_ms: 3500     # minimum reading time for a translated final
+    # Keep the caption out of screen captures/shares; set false to record demos
+    # (an overlapping caption is then OCR'd as slide text).
+    exclude_from_capture: true
   ocr_overlay:
     enabled: true
     background: "#101418"
