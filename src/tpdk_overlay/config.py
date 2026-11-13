@@ -182,6 +182,10 @@ class SummaryConfig(_Section):
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     timeout_s: float = Field(default=60.0, gt=0)
     min_request_interval_s: float = Field(default=4.5, ge=0.0)
+    # 429/5xx retries; anything else (bad key, unknown model) fails fast.
+    max_attempts: int = Field(default=3, ge=1, le=8)
+    retry_base_s: float = Field(default=1.0, gt=0)
+    retry_max_s: float = Field(default=20.0, gt=0)
 
     def api_key(self) -> str | None:
         raw = os.getenv(self.api_key_env)

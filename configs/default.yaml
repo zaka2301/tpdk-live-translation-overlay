@@ -102,6 +102,9 @@ summary:
   temperature: 0.2
   timeout_s: 60
   min_request_interval_s: 4.5
+  max_attempts: 3
+  retry_base_s: 1.0
+  retry_max_s: 20.0
 
 ui:
   caption:

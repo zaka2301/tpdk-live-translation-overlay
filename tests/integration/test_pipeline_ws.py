@@ -26,7 +26,13 @@ from tpdk_overlay.audio.vad import VAD_FRAME_MS, VAD_FRAME_SAMPLES, SpeechStart,
 from tpdk_overlay.config import AppConfig, load_config
 from tpdk_overlay.contracts import BBox
 from tpdk_overlay.pipeline.orchestrator import PipelinePorts
-from tpdk_overlay.ports import AsrUpdate, OcrLine
+from tpdk_overlay.ports import (
+    AsrUpdate,
+    CheckpointSummaryRequest,
+    FinalSummaryRequest,
+    OcrLine,
+    SummarizerUnavailable,
+)
 from tpdk_overlay.screen.change import SlideChangeDetector
 from tpdk_overlay.server.app import create_app
 
@@ -180,6 +186,27 @@ class FakeTranslator:
         pass
 
 
+class FakeSummarizer:
+    """Record summary requests; ``fail`` mimics an unreachable Gemini API."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.checkpoint_requests: list[CheckpointSummaryRequest] = []
+        self.final_requests: list[FinalSummaryRequest] = []
+
+    async def checkpoint(self, request: CheckpointSummaryRequest) -> str:
+        if self.fail:
+            raise SummarizerUnavailable("gemini unreachable")
+        self.checkpoint_requests.append(request)
+        return f"## Topik\ncheckpoint {request.checkpoint_id}"
+
+    async def final(self, request: FinalSummaryRequest) -> str:
+        if self.fail:
+            raise SummarizerUnavailable("gemini unreachable")
+        self.final_requests.append(request)
+        return "## Ringkasan\nfinal summary\n## Poin Penting\n- key point"
+
+
 class FakeScreenSource:
     """Return whatever frame the test currently wants the slide to show."""
 
@@ -223,8 +250,17 @@ def _config(tmp_path: Path) -> AppConfig:
     )
 
 
+def _summary_config(tmp_path: Path) -> AppConfig:
+    config = _config(tmp_path)
+    return config.model_copy(
+        update={"summary": config.summary.model_copy(update={"enabled": True})}
+    )
+
+
 def _ports(
-    asr_client: FakeAsrClient, translator: Any | None = None
+    asr_client: FakeAsrClient,
+    translator: Any | None = None,
+    summarizer: Any | None = None,
 ) -> PipelinePorts:
     script = [np.full(FRAME, 0.4, dtype=np.float32)] * 10 + [
         np.zeros(FRAME, dtype=np.float32)
@@ -235,6 +271,7 @@ def _ports(
         asr_client=asr_client,
         translator=translator or FakeTranslator(),
         segmenter_factory=lambda: segmenter,
+        summarizer=summarizer,
     )
 
 
@@ -269,6 +306,25 @@ def _wait_for(
         if predicate(message):
             return message, seen
     raise AssertionError(f"timed out; saw {[message.get('type') for message in seen]}")
+
+
+def _wait_for_all(
+    ws: Any,
+    predicates: dict[str, Any],
+    timeout: float = 10.0,
+) -> dict[str, dict[str, Any]]:
+    """Receive until every named predicate matched once (any arrival order)."""
+
+    remaining = dict(predicates)
+    found: dict[str, dict[str, Any]] = {}
+    deadline = time.monotonic() + timeout
+    while remaining:
+        message = _recv(ws, timeout=max(0.1, deadline - time.monotonic()))
+        for name, predicate in list(remaining.items()):
+            if predicate(message):
+                found[name] = message
+                del remaining[name]
+    return found
 
 
 def test_session_pipeline_persists_artifacts(tmp_path: Path) -> None:
@@ -941,3 +997,138 @@ def test_region_update_resets_slide_detector(tmp_path: Path) -> None:
             lambda message: message["type"] == "session.state"
             and message["state"] == "stopped",
         )
+
+
+def test_checkpoints_and_auto_final_summary_are_persisted(tmp_path: Path) -> None:
+    """A 1 s interval emits summary.checkpoint; stop writes summary_final.md."""
+
+    summarizer = FakeSummarizer()
+    loud = np.full(FRAME, 0.4, dtype=np.float32)
+    quiet = np.zeros(FRAME, dtype=np.float32)
+    # ~1.1 s of wall time (10 ms per frame): enough for one 1 s checkpoint.
+    script = ([loud] * 20 + [quiet] * 8) * 4
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource(script),
+            asr_client=FakeAsrClient(),
+            translator=FakeTranslator(),
+            segmenter_factory=FakeSegmenter,
+            summarizer=summarizer,
+        )
+
+    app = create_app(_summary_config(tmp_path), ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "source_lang": "en",
+                    "target_lang": "id",
+                    "checkpoint_interval_s": 1,
+                }
+            )
+        )
+        checkpoint, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "summary.checkpoint",
+            timeout=10.0,
+        )
+        assert checkpoint["status"] == "ok"
+        assert checkpoint["markdown"] == "## Topik\ncheckpoint 1"
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        landed = _wait_for_all(
+            ws,
+            {
+                "stopped": lambda message: message["type"] == "session.state"
+                and message["state"] == "stopped",
+                "final": lambda message: message["type"] == "summary.final",
+            },
+        )
+        final = landed["final"]
+        assert final["checkpoint_count"] >= 1
+        assert final["markdown"].startswith("## Ringkasan")
+
+    session_dir = next((tmp_path / "data" / "sessions").iterdir())
+    checkpoint_file = session_dir / "summary_checkpoint_01.md"
+    final_file = session_dir / "summary_final.md"
+    assert checkpoint_file.read_text(encoding="utf-8") == "## Topik\ncheckpoint 1\n"
+    assert final_file.read_text(encoding="utf-8").startswith("## Ringkasan")
+    assert summarizer.checkpoint_requests
+    assert "hello world" in summarizer.checkpoint_requests[0].transcript
+    assert summarizer.final_requests[0].checkpoints == ["## Topik\ncheckpoint 1"]
+
+
+def test_degraded_checkpoint_keeps_transcribing(tmp_path: Path) -> None:
+    """A failing cloud summary degrades one event; capture keeps running."""
+
+    summarizer = FakeSummarizer(fail=True)
+    loud = np.full(FRAME, 0.4, dtype=np.float32)
+    quiet = np.zeros(FRAME, dtype=np.float32)
+    # ~2.8 s of speech so finals keep landing after the degraded checkpoint.
+    script = ([loud] * 20 + [quiet] * 8) * 10
+
+    def factory(_config: AppConfig) -> PipelinePorts:
+        return PipelinePorts(
+            audio_source=FakeAudioSource(script),
+            asr_client=FakeAsrClient(),
+            translator=FakeTranslator(),
+            segmenter_factory=FakeSegmenter,
+            summarizer=summarizer,
+        )
+
+    app = create_app(_summary_config(tmp_path), ports_factory=factory)
+
+    with TestClient(app) as client, client.websocket_connect("/ws") as ws:
+        assert _recv(ws)["state"] == "idle"
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "source_lang": "en",
+                    "target_lang": "id",
+                    "checkpoint_interval_s": 1,
+                }
+            )
+        )
+        degraded, _ = _wait_for(
+            ws,
+            lambda message: message["type"] == "summary.checkpoint"
+            and message["status"] == "degraded",
+            timeout=10.0,
+        )
+        assert degraded["markdown"].startswith("_Checkpoint")
+        assert client.get("/api/health").json()["state"] == "running"
+
+        # A final that arrives after the failure proves transcription continued.
+        _wait_for(
+            ws,
+            lambda message: message["type"] == "transcript.segment"
+            and message["status"] == "final"
+            and message.get("translation_status") == "ok",
+            timeout=10.0,
+        )
+
+        ws.send_text(json.dumps({"type": "session.stop"}))
+        _wait_for_all(
+            ws,
+            {
+                "stopped": lambda message: message["type"] == "session.state"
+                and message["state"] == "stopped",
+                "failed": lambda message: message["type"] == "notice"
+                and message["code"] == "summary_failed",
+            },
+        )
+
+    session_dir = next((tmp_path / "data" / "sessions").iterdir())
+    assert (session_dir / "summary_checkpoint_01.md").exists()
+    assert not (session_dir / "summary_final.md").exists()
+    rows = [
+        json.loads(line)
+        for line in (session_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) >= 2

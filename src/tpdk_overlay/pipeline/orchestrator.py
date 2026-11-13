@@ -71,6 +71,13 @@ from tpdk_overlay.ports import (
     Summarizer,
     Translator,
 )
+from tpdk_overlay.summarize.checkpoints import (
+    format_slides,
+    format_transcript,
+    release_window,
+    remaining_transcript,
+    take_window,
+)
 from tpdk_overlay.utils.clock import Stopwatch, now_ms
 
 logger = logging.getLogger(__name__)
@@ -207,11 +214,11 @@ def build_default_ports(
     summarizer: Summarizer | None = None
     if config.summary.enabled and config.summary.api_key():
         try:
-            from tpdk_overlay.summarize.gemini import GeminiSummarizer
-        except ImportError:
-            logger.debug("summarizer adapter is not available yet; summaries stay off")
-        else:
-            summarizer = GeminiSummarizer(config.summary)
+            from tpdk_overlay.summarize import create_summarizer
+
+            summarizer = create_summarizer(config.summary)
+        except (ImportError, ValueError):
+            logger.debug("summarizer adapter is not available; summaries stay off")
 
     return PipelinePorts(
         audio_source=create_audio_source(config.audio),
@@ -412,6 +419,10 @@ class Orchestrator:
         ports = self._ports
         if ports is not None:
             alive = await asyncio.to_thread(self._join_workers, ports, deadline)
+            # Workers joined, so translations that landed during the stop
+            # window are in the prompt. The cloud call runs in the background
+            # and never delays the 3 s stop budget.
+            self._schedule_final_summary()
             ports_to_release = self._ports
             self._ports = None
             if alive:
@@ -527,26 +538,51 @@ class Orchestrator:
     def request_final_summary(self) -> None:
         """Synthesize the consolidated summary in the background."""
 
-        if self._ports is None or self._ports.summarizer is None or self._session is None:
-            self._notice(
-                NoticeLevel.WARNING,
-                "summary_unavailable",
-                "no summarizer is configured; final summary skipped",
-            )
-            return
-        if self._summary_task is not None and not self._summary_task.done():
-            self._notice(
-                NoticeLevel.INFO,
-                "summary_pending",
-                "the final summary is already being generated",
-            )
-            return
+        self._schedule_final_summary(announce=True)
+
+    def _schedule_final_summary(self, *, announce: bool = False) -> None:
+        """Capture the session inputs and schedule ``summary.final``.
+
+        ``announce`` drives the WS-command path, which reports why nothing was
+        scheduled. The automatic call on stop stays silent: a transcript-only
+        session simply ends without a summary.
+        """
+
         ports = self._ports
         session = self._session
         settings = self._settings
+        if (
+            ports is None
+            or ports.summarizer is None
+            or session is None
+            or settings is None
+        ):
+            if announce:
+                self._notice(
+                    NoticeLevel.WARNING,
+                    "summary_unavailable",
+                    "no summarizer is configured; final summary skipped",
+                )
+            return
+        if self._summary_task is not None and not self._summary_task.done():
+            if announce:
+                self._notice(
+                    NoticeLevel.INFO,
+                    "summary_pending",
+                    "the final summary is already being generated",
+                )
+            return
         with self._records_lock:
             records = list(self._final_records)
             checkpoints = list(self._checkpoint_markdowns)
+        if not records and not checkpoints:
+            if announce:
+                self._notice(
+                    NoticeLevel.INFO,
+                    "summary_empty",
+                    "there is no transcript or slide text to summarize yet",
+                )
+            return
         self._summary_task = asyncio.create_task(
             self._run_final_summary(
                 ports.summarizer,
@@ -1423,36 +1459,14 @@ class Orchestrator:
             # its translation lands. Selecting by the "checkpointed" flag (not
             # just by the window) guarantees a segment that finished while the
             # previous checkpoint was being written still enters a summary.
-            segments = [
-                record
-                for record in self._final_records
-                if not record["checkpointed"] and record["t_end_ms"] < t_to_ms
-            ]
-            slides = [
-                record
-                for record in self._slide_records
-                if not record["checkpointed"] and record["t_capture_ms"] < t_to_ms
-            ]
-            for record in segments:
-                record["checkpointed"] = True
-            for record in slides:
-                record["checkpointed"] = True
+            segments, slides = take_window(
+                self._final_records, self._slide_records, t_to_ms=t_to_ms
+            )
         if not segments and not slides:
             return
 
-        transcript = "\n".join(
-            f"[{record['t_start_ms']}-{record['t_end_ms']} ms] {record['text']}"
-            f" | {record['translation']}"
-            for record in segments
-        )
-        slide_text = "\n\n".join(
-            f"[{record['t_capture_ms']} ms]\n"
-            + "\n".join(
-                block.get("translation") or block.get("text", "")
-                for block in record["blocks"]
-            )
-            for record in slides
-        )
+        transcript = format_transcript(segments)
+        slide_text = format_slides(slides)
         self._checkpoint_id += 1
         checkpoint_id = self._checkpoint_id
         request = CheckpointSummaryRequest(
@@ -1469,6 +1483,10 @@ class Orchestrator:
         try:
             markdown = await ports.summarizer.checkpoint(request)
         except asyncio.CancelledError:
+            # stop() cancels the in-flight cloud call; hand the window back to
+            # the final summary instead of losing those segments.
+            with self._records_lock:
+                release_window(segments, slides)
             raise
         except Exception as exc:  # noqa: BLE001 - summaries degrade, they never stop capture
             logger.warning("checkpoint %d failed: %s", checkpoint_id, exc)
@@ -1498,12 +1516,7 @@ class Orchestrator:
         checkpoints: list[str],
         t_to_ms: int,
     ) -> None:
-        transcript = "\n".join(
-            f"[{record['t_start_ms']}-{record['t_end_ms']} ms] {record['text']}"
-            f" | {record['translation']}"
-            for record in records
-            if not record["checkpointed"]
-        )
+        transcript = remaining_transcript(records)
         request = FinalSummaryRequest(
             checkpoints=checkpoints,
             transcript=transcript,
