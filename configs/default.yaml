@@ -80,10 +80,10 @@ screen:
   region: null            # {left, top, width, height} in physical pixels; null = pick in the UI
   capture_interval_ms: 1000
   change_threshold: 0.02  # fraction of pixels that must change to trigger OCR
-  # Recording mode: keep the overlay visible to OBS/screen shares and hide it
-  # only around each OCR grab (brief blink when the slide changes). Leave false
-  # to exclude the overlay from capture entirely.
-  hide_overlay_during_capture: false
+  # Recording mode: keep the caption and slide overlay visible to OBS/screen
+  # shares and hide them only around each OCR grab (brief blink when the slide
+  # changes). Leave false to exclude both overlays from capture entirely.
+  recording_mode: true
 
 ocr:
   enabled: true
@@ -120,9 +120,6 @@ ui:
     font_size: 18
     translation_font_size: 18
     final_hold_ms: 3500     # minimum reading time for a translated final
-    # Keep the caption out of screen captures/shares; set false to record demos
-    # (an overlapping caption is then OCR'd as slide text).
-    exclude_from_capture: true
   ocr_overlay:
     enabled: true
     background: "#101010"  # neutral graphite, matches ui/theme.py

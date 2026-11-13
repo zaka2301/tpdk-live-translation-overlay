@@ -320,6 +320,7 @@ class CaptionWindow(QWidget):
         target_lang: str,
         checkpoint_interval_s: int,
         languages: Sequence[str] | None = None,
+        capture_excluded: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -329,6 +330,7 @@ class CaptionWindow(QWidget):
             | Qt.WindowType.Tool,
         )
         self._caption = ui.caption
+        self._capture_excluded = bool(capture_excluded)
         self._languages = tuple(languages) if languages is not None else tuple(ISO_TO_NLLB)
         self._click_through = bool(ui.click_through)
         self._state = SessionState.IDLE
@@ -1008,9 +1010,10 @@ class CaptionWindow(QWidget):
 
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
-        # The caption can overlap the captured slide region; keep it out of the
-        # OCR grabs (and screen shares) without hiding it from the user.
-        if self._caption.exclude_from_capture:
+        # Recording mode leaves the caption capturable (the OCR loop hides it
+        # around each grab); otherwise keep it out of captures and screen shares
+        # without hiding it from the user.
+        if self._capture_excluded:
             exclude_from_capture(self)
         # Re-fit after a hidden window is shown; show() is not guaranteed to
         # emit resizeEvent when the geometry did not change.

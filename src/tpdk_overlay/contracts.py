@@ -194,7 +194,7 @@ class OverlayVisibilityEvent(Event):
     overlaps the captured region), acknowledges with ``RenderAckCommand`` once
     the window is off the compositor, and restores its own visibility
     afterwards. The backend only sends it when
-    ``screen.hide_overlay_during_capture`` is on, so the overlays stay visible to
+    ``screen.recording_mode`` is on, so the overlays stay visible to
     OBS/screen shares and the OCR loop still grabs clean pixels.
     """
 

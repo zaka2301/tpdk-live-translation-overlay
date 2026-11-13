@@ -1384,7 +1384,7 @@ class Orchestrator:
         if score < self._config.screen.change_threshold:
             return
 
-        if self._config.screen.hide_overlay_during_capture:
+        if self._config.screen.recording_mode:
             # Recording mode: the grab contains our own windows, so OCR needs a
             # second, clean frame with both overlays hidden for this instant.
             clean = self._capture_with_overlay_hidden(region, ports)
@@ -1448,7 +1448,7 @@ class Orchestrator:
             change_ts_ms=change_ts_ms,
         )
         self._publish(event)
-        if self._config.screen.hide_overlay_during_capture:
+        if self._config.screen.recording_mode:
             if blocks:
                 # Mask these panels out of the next change score; the previous
                 # frame's boxes stay for one pass because paint lags the emit.
@@ -1473,7 +1473,7 @@ class Orchestrator:
     def _capture_mask(self, region: ScreenRegion) -> tuple[BBox, ...]:
         """Overlay boxes to ignore in the slide-change score (recording mode)."""
 
-        if not self._config.screen.hide_overlay_during_capture:
+        if not self._config.screen.recording_mode:
             return ()
         boxes = [bbox for rects in self._recent_frame_rects for bbox in rects]
         caption = self._caption_mask(region)
@@ -1500,7 +1500,7 @@ class Orchestrator:
     ) -> ImageArray | None:
         """Grab the slide with the UI windows hidden just for the instant.
 
-        ``screen.hide_overlay_during_capture`` keeps both the caption and the
+        ``screen.recording_mode`` keeps both the caption and the
         OCR overlay capturable, so OBS and screen shares show them. The OCR
         loop asks the UI to hide them before the grab and restores them right
         after; the windows are missing for ~50 ms, which a recording shows as

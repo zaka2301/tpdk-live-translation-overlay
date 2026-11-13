@@ -263,6 +263,7 @@ class OverlayApp(QObject):
             target_lang=self._target_lang,
             checkpoint_interval_s=self._checkpoint_s,
             languages=self._languages,
+            capture_excluded=not config.screen.recording_mode,
         )
         self._caption.set_region(self._region)
         self._history = HistoryWindow(config.ui)
@@ -271,7 +272,7 @@ class OverlayApp(QObject):
             OcrOverlayWindow(
                 config.ui.ocr_overlay,
                 click_through=self._click_through,
-                capture_excluded=not config.screen.hide_overlay_during_capture,
+                capture_excluded=not config.screen.recording_mode,
             )
             if config.ui.ocr_overlay.enabled
             and config.screen.enabled

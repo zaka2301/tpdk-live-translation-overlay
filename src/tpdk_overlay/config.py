@@ -158,10 +158,12 @@ class ScreenConfig(_Section):
     region: ScreenRegion | None = None
     capture_interval_ms: int = Field(default=1000, ge=100)
     change_threshold: float = Field(default=0.02, ge=0.0, le=1.0)
-    # Recording mode: leave the overlay capturable by OBS/screen shares and
-    # hide it only for the instant the OCR loop grabs the region (a brief blink
-    # when the slide changes). The default excludes it from capture instead.
-    hide_overlay_during_capture: bool = False
+    # Recording mode: the caption and slide overlay stay visible to OBS and
+    # screen shares, and the OCR loop hides them for the instant it grabs the
+    # region (a brief blink when the slide changes). Off by default: the
+    # overlays are excluded from screen capture entirely, so recordings and
+    # shares never contain them.
+    recording_mode: bool = False
 
 
 class OcrConfig(_Section):
@@ -209,10 +211,6 @@ class CaptionConfig(_Section):
     # Minimum time a translated final remains before the next segment may
     # replace it; the caption coalesces events while it is held.
     final_hold_ms: int = Field(default=2200, ge=0, le=10_000)
-    # Keep the caption out of screen captures/shares (it can overlap the slide
-    # region). Set false to record demos; an overlapping caption is then read
-    # back by OCR as slide text.
-    exclude_from_capture: bool = True
 
 
 class OcrOverlayConfig(_Section):

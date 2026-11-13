@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from tpdk_overlay.config import CaptionConfig, OcrOverlayConfig, UiConfig
+from tpdk_overlay.config import OcrOverlayConfig, UiConfig
 from tpdk_overlay.contracts import (
     BBox,
     OcrBlock,
@@ -189,10 +189,11 @@ def test_caption_can_be_kept_in_recordings(
 
     monkeypatch.setattr("tpdk_overlay.ui.caption.exclude_from_capture", spy)
     caption = CaptionWindow(
-        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        UiConfig(),
         source_lang="en",
         target_lang="id",
         checkpoint_interval_s=300,
+        capture_excluded=False,
     )
     caption.show()
     qt_app.processEvents()
@@ -375,7 +376,7 @@ def test_capture_guard_restores_windows_when_an_ack_is_dropped(
 def test_caption_rect_is_masked_inside_the_region() -> None:
     orchestrator = _orchestrator_stub()
     orchestrator._config = SimpleNamespace(
-        screen=SimpleNamespace(hide_overlay_during_capture=True)
+        screen=SimpleNamespace(recording_mode=True)
     )
     orchestrator.record_render_ack(
         "ack-caption",
@@ -400,7 +401,7 @@ def test_hiding_the_caption_drops_its_mask() -> None:
 def test_caption_mask_outside_the_region_is_ignored() -> None:
     orchestrator = _orchestrator_stub()
     orchestrator._config = SimpleNamespace(
-        screen=SimpleNamespace(hide_overlay_during_capture=True)
+        screen=SimpleNamespace(recording_mode=True)
     )
     orchestrator.record_render_ack(
         "ack-caption",
@@ -434,10 +435,11 @@ def test_caption_hides_for_capture_and_reports_its_rect(
     qt_app: QApplication,
 ) -> None:
     caption = CaptionWindow(
-        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        UiConfig(),
         source_lang="en",
         target_lang="id",
         checkpoint_interval_s=300,
+        capture_excluded=False,
     )
     caption.show()
     qt_app.processEvents()
@@ -467,10 +469,11 @@ def test_caption_stays_visible_when_it_is_outside_the_region(
     qt_app: QApplication,
 ) -> None:
     caption = CaptionWindow(
-        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        UiConfig(),
         source_lang="en",
         target_lang="id",
         checkpoint_interval_s=300,
+        capture_excluded=False,
     )
     caption.show()
     qt_app.processEvents()
@@ -497,10 +500,11 @@ def test_final_ack_waits_for_the_caption_to_come_back(
     qt_app: QApplication,
 ) -> None:
     caption = CaptionWindow(
-        UiConfig(caption=CaptionConfig(exclude_from_capture=False)),
+        UiConfig(),
         source_lang="en",
         target_lang="id",
         checkpoint_interval_s=300,
+        capture_excluded=False,
     )
     caption.show()
     qt_app.processEvents()
