@@ -27,6 +27,9 @@ class _History:
     def set_session(self, session_id: str) -> None:
         self.session_id = session_id
 
+    def show(self) -> None:
+        pass
+
 
 class _FakeOverlay:
     _on_session_state = OverlayApp._on_session_state
@@ -37,7 +40,7 @@ class _FakeOverlay:
         self._state = SessionState.IDLE
         self._session_id: str | None = None
         self._caption = _Caption()
-        self._caption_capture_hidden = False
+        self._capture_hidden: set[str] = set()
         self._history = _History()
         self.started = 0
 

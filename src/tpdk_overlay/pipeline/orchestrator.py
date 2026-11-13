@@ -99,8 +99,21 @@ _OCR_IDLE_WAIT_S = 0.2
 # grabbing the screen. Without the settle, BitBlt can still see the old frame.
 _CAPTURE_HIDE_TIMEOUT_S = 1.0
 _CAPTURE_SETTLE_S = 0.05
-# Both UI windows are capturable in recording mode; the grab hides each.
-_CAPTURE_OVERLAY_TARGETS = ("ocr", "caption")
+# The UI windows that can sit over the slide in recording mode; the grab
+# hides each and its ack reports the rect to mask.
+_CAPTURE_OVERLAY_TARGETS = ("ocr", "caption", "history")
+
+
+def _clip_to_region(rect: ScreenRegion, region: ScreenRegion) -> BBox | None:
+    """``rect`` in ``region``-relative pixels, or ``None`` when disjoint."""
+
+    x0 = max(rect.left, region.left)
+    y0 = max(rect.top, region.top)
+    x1 = min(rect.left + rect.width, region.left + region.width)
+    y1 = min(rect.top + rect.height, region.top + region.height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return BBox(x=x0 - region.left, y=y0 - region.top, w=x1 - x0, h=y1 - y0)
 # Send audio to the ASR worker in 0.25 s chunks instead of 32 ms frames: a
 # bounded queue then holds ~2 s of audio before it applies backpressure.
 _ASR_CHUNK_SAMPLES = 4_000
@@ -277,7 +290,9 @@ class Orchestrator:
         # overlay out of the slide-change score, and the capture grab waits for
         # a render.ack before it trusts the screen.
         self._recent_frame_rects: deque[tuple[BBox, ...]] = deque(maxlen=2)
-        self._caption_rect: ScreenRegion | None = None
+        # Physical rect per UI window, reported with its capture-hide ack.
+        self._overlay_rects: dict[str, ScreenRegion] = {}
+        self._capture_ack_targets: dict[str, str] = {}
         self._capture_ack_lock = threading.Lock()
         self._capture_ack_waiters: dict[str, threading.Event] = {}
 
@@ -549,26 +564,31 @@ class Orchestrator:
         self._overlay_visibility[target] = visible
         if not visible:
             # A hidden window cannot contaminate the grab; stop masking it.
+            self._overlay_rects.pop(target, None)
             if target == "ocr":
                 self._recent_frame_rects.clear()
-            elif target == "caption":
-                self._caption_rect = None
         logger.debug("overlay %s visibility -> %s", target, visible)
 
     def record_render_ack(
         self,
         event_id: str,
         painted_ts_ms: int,
-        caption_rect: ScreenRegion | None = None,
+        rect: ScreenRegion | None = None,
     ) -> None:
         with self._capture_ack_lock:
             waiter = self._capture_ack_waiters.pop(event_id, None)
+            target = self._capture_ack_targets.pop(event_id, None)
         if waiter is not None:
             waiter.set()
-        if caption_rect is not None:
-            # Reported with the caption capture-hide ack; the mask keeps the
-            # caption's repaints out of the slide-change score.
-            self._caption_rect = caption_rect
+        if target is not None:
+            # The ack belongs to a capture hide: the mask keeps that window's
+            # repaints out of the slide-change score. ``rect=None`` means the
+            # window was not visible (closed or hidden by the user), so its
+            # stale mask must go instead of blinding the detector under it.
+            if rect is None:
+                self._overlay_rects.pop(target, None)
+            else:
+                self._overlay_rects[target] = rect
         if self._metrics is not None:
             self._metrics.ack(event_id, painted_ts_ms)
 
@@ -1476,24 +1496,11 @@ class Orchestrator:
         if not self._config.screen.recording_mode:
             return ()
         boxes = [bbox for rects in self._recent_frame_rects for bbox in rects]
-        caption = self._caption_mask(region)
-        if caption is not None:
-            boxes.append(caption)
+        for rect in self._overlay_rects.values():
+            box = _clip_to_region(rect, region)
+            if box is not None:
+                boxes.append(box)
         return tuple(boxes)
-
-    def _caption_mask(self, region: ScreenRegion) -> BBox | None:
-        """The caption's reported rect clipped into the captured region."""
-
-        rect = self._caption_rect
-        if rect is None:
-            return None
-        x0 = max(rect.left, region.left)
-        y0 = max(rect.top, region.top)
-        x1 = min(rect.left + rect.width, region.left + region.width)
-        y1 = min(rect.top + rect.height, region.top + region.height)
-        if x1 <= x0 or y1 <= y0:
-            return None
-        return BBox(x=x0 - region.left, y=y0 - region.top, w=x1 - x0, h=y1 - y0)
 
     def _capture_with_overlay_hidden(
         self, region: ScreenRegion, ports: PipelinePorts
@@ -1548,6 +1555,9 @@ class Orchestrator:
         waiters = {event.event_id: threading.Event() for event in events}
         with self._capture_ack_lock:
             self._capture_ack_waiters.update(waiters)
+            self._capture_ack_targets.update(
+                {event.event_id: event.target for event in events}
+            )
         try:
             for event in events:
                 self._publish(event)
@@ -1565,6 +1575,7 @@ class Orchestrator:
             with self._capture_ack_lock:
                 for event_id in waiters:
                     self._capture_ack_waiters.pop(event_id, None)
+                    self._capture_ack_targets.pop(event_id, None)
 
     def _await_render_ack(
         self, event: OverlayVisibilityEvent, timeout_s: float
@@ -1775,7 +1786,7 @@ class Orchestrator:
         self._checkpoint_id = 0
         self._last_checkpoint_to_ms = 0
         self._recent_frame_rects.clear()
-        self._caption_rect = None
+        self._overlay_rects.clear()
         with self._capture_ack_lock:
             for waiter in self._capture_ack_waiters.values():
                 waiter.set()

@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from tpdk_overlay.config import OcrOverlayConfig, UiConfig
@@ -30,7 +31,7 @@ from tpdk_overlay.contracts import (
 from tpdk_overlay.pipeline.orchestrator import Orchestrator
 from tpdk_overlay.ui import capture_guard
 from tpdk_overlay.ui.app import OverlayApp
-from tpdk_overlay.ui.caption import CaptionWindow, RegionPicker
+from tpdk_overlay.ui.caption import CaptionWindow, HistoryWindow, RegionPicker
 from tpdk_overlay.ui.capture_guard import exclude_from_capture
 from tpdk_overlay.ui.ocr_overlay import OcrOverlayWindow
 
@@ -277,7 +278,8 @@ def _orchestrator_stub() -> Orchestrator:
     orchestrator._session = None
     orchestrator._stop_event = threading.Event()
     orchestrator._recent_frame_rects = deque(maxlen=2)
-    orchestrator._caption_rect = None
+    orchestrator._overlay_rects = {}
+    orchestrator._capture_ack_targets = {}
     return orchestrator
 
 
@@ -339,8 +341,10 @@ def test_capture_guard_hides_the_caption_and_the_ocr_overlay() -> None:
     assert [(event.target, event.visible) for event in published] == [
         ("ocr", False),
         ("caption", False),
+        ("history", False),
         ("ocr", True),
         ("caption", True),
+        ("history", True),
     ]
 
 
@@ -370,43 +374,87 @@ def test_capture_guard_restores_windows_when_an_ack_is_dropped(
     assert [(event.target, event.visible) for event in published if event.visible] == [
         ("ocr", True),
         ("caption", True),
+        ("history", True),
     ]
 
 
-def test_caption_rect_is_masked_inside_the_region() -> None:
+def test_capture_guard_masks_the_window_rects_it_was_told_about() -> None:
     orchestrator = _orchestrator_stub()
     orchestrator._config = SimpleNamespace(
         screen=SimpleNamespace(recording_mode=True)
     )
-    orchestrator.record_render_ack(
-        "ack-caption",
-        0,
-        ScreenRegion(left=100, top=600, width=400, height=100),
+    rects = {
+        "caption": ScreenRegion(left=100, top=600, width=400, height=100),
+        "history": ScreenRegion(left=900, top=100, width=200, height=300),
+    }
+
+    def publish(event: OverlayVisibilityEvent) -> None:
+        if not event.visible:
+            orchestrator.record_render_ack(event.event_id, 0, rects.get(event.target))
+
+    orchestrator._publish = publish
+    ports = SimpleNamespace(
+        screen_source=SimpleNamespace(
+            capture=lambda region: np.zeros((720, 1280, 3), dtype=np.uint8)
+        )
     )
-    region = ScreenRegion(left=50, top=500, width=600, height=300)
+    region = ScreenRegion(left=0, top=0, width=1280, height=720)
 
-    assert orchestrator._capture_mask(region) == (BBox(x=50, y=100, w=400, h=100),)
+    assert orchestrator._capture_with_overlay_hidden(region, ports) is not None
+    assert orchestrator._capture_mask(region) == (
+        BBox(x=100, y=600, w=400, h=100),
+        BBox(x=900, y=100, w=200, h=300),
+    )
 
 
-def test_hiding_the_caption_drops_its_mask() -> None:
+def test_hiding_a_window_drops_its_mask() -> None:
     orchestrator = _orchestrator_stub()
-    orchestrator._overlay_visibility = {"ocr": True, "caption": True}
-    orchestrator._caption_rect = ScreenRegion(left=0, top=0, width=100, height=50)
+    orchestrator._overlay_visibility = {"ocr": True, "caption": True, "history": True}
+    orchestrator._overlay_rects["history"] = ScreenRegion(
+        left=0, top=0, width=100, height=50
+    )
 
-    orchestrator.set_overlay_visibility("caption", False)
+    orchestrator.set_overlay_visibility("history", False)
 
-    assert orchestrator._caption_rect is None
+    assert "history" not in orchestrator._overlay_rects
 
 
-def test_caption_mask_outside_the_region_is_ignored() -> None:
+def test_capture_ack_without_a_rect_clears_the_window_mask() -> None:
+    """A window closed/hidden by the user must stop masking its old spot."""
+
     orchestrator = _orchestrator_stub()
     orchestrator._config = SimpleNamespace(
         screen=SimpleNamespace(recording_mode=True)
     )
-    orchestrator.record_render_ack(
-        "ack-caption",
-        0,
-        ScreenRegion(left=2000, top=1200, width=400, height=100),
+    orchestrator._overlay_rects["history"] = ScreenRegion(
+        left=100, top=100, width=200, height=200
+    )
+
+    def publish(event: OverlayVisibilityEvent) -> None:
+        if not event.visible:
+            # The history was closed: its hide ack carries no rect.
+            orchestrator.record_render_ack(event.event_id, 0, None)
+
+    orchestrator._publish = publish
+    ports = SimpleNamespace(
+        screen_source=SimpleNamespace(
+            capture=lambda region: np.zeros((4, 4, 3), dtype=np.uint8)
+        )
+    )
+    region = ScreenRegion(left=0, top=0, width=4, height=4)
+
+    orchestrator._capture_with_overlay_hidden(region, ports)
+
+    assert "history" not in orchestrator._overlay_rects
+
+
+def test_window_mask_outside_the_region_is_ignored() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._config = SimpleNamespace(
+        screen=SimpleNamespace(recording_mode=True)
+    )
+    orchestrator._overlay_rects["caption"] = ScreenRegion(
+        left=2000, top=1200, width=400, height=100
     )
     region = ScreenRegion(left=0, top=0, width=1280, height=720)
 
@@ -414,15 +462,21 @@ def test_caption_mask_outside_the_region_is_ignored() -> None:
 
 
 class _CaptionHost:
-    """Binds the app's caption capture-visibility handler to a real window."""
+    """Binds the app's window capture-visibility handling to real windows."""
 
     _on_overlay_visibility = OverlayApp._on_overlay_visibility
-    _hide_caption_for_capture = OverlayApp._hide_caption_for_capture
+    _hide_window_for_capture = OverlayApp._hide_window_for_capture
     _flush_pending_final_acks = OverlayApp._flush_pending_final_acks
 
-    def __init__(self, caption: CaptionWindow, region: ScreenRegion) -> None:
+    def __init__(
+        self,
+        caption: CaptionWindow,
+        region: ScreenRegion,
+        history: HistoryWindow | None = None,
+    ) -> None:
         self._caption = caption
-        self._caption_capture_hidden = False
+        self._history = history
+        self._capture_hidden: set[str] = set()
         self._region = region
         self._pending_final_acks: list[str] = []
         self.sent: list[object] = []
@@ -455,8 +509,8 @@ def test_caption_hides_for_capture_and_reports_its_rect(
     ack = host.sent[0]
     assert isinstance(ack, RenderAckCommand)
     assert ack.event_id == hide.event_id
-    assert ack.caption_rect is not None
-    assert ack.caption_rect.width > 0 and ack.caption_rect.height > 0
+    assert ack.rect is not None
+    assert ack.rect.width > 0 and ack.rect.height > 0
 
     host._on_overlay_visibility(
         OverlayVisibilityEvent(target="caption", visible=True)
@@ -486,8 +540,48 @@ def test_caption_stays_visible_when_it_is_outside_the_region(
     )
 
     assert caption.isVisible()
-    assert host.sent[0].caption_rect is not None
+    assert host.sent[0].rect is not None
     caption.close()
+
+
+def test_history_hides_for_capture_and_reports_its_rect(
+    qt_app: QApplication,
+) -> None:
+    caption = CaptionWindow(
+        UiConfig(),
+        source_lang="en",
+        target_lang="id",
+        checkpoint_interval_s=300,
+        capture_excluded=False,
+    )
+    history = HistoryWindow(UiConfig(), capture_excluded=False)
+    caption.show()
+    history.show()
+    qt_app.processEvents()
+    host = _CaptionHost(
+        caption,
+        ScreenRegion(left=-10000, top=-10000, width=40000, height=40000),
+        history,
+    )
+
+    # Restoring the window after a grab must not pull focus from the lecture.
+    assert history.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+    hide = OverlayVisibilityEvent(target="history", visible=False)
+    host._on_overlay_visibility(hide)
+
+    assert not history.isVisible()
+    ack = host.sent[0]
+    assert isinstance(ack, RenderAckCommand)
+    assert ack.event_id == hide.event_id
+    assert ack.rect is not None
+
+    host._on_overlay_visibility(
+        OverlayVisibilityEvent(target="history", visible=True)
+    )
+    assert history.isVisible()
+    caption.close()
+    history.close()
 
 
 class _FinalAckHost(_CaptionHost):

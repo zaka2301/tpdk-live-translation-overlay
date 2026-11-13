@@ -266,7 +266,10 @@ class OverlayApp(QObject):
             capture_excluded=not config.screen.recording_mode,
         )
         self._caption.set_region(self._region)
-        self._history = HistoryWindow(config.ui)
+        self._history = HistoryWindow(
+            config.ui,
+            capture_excluded=not config.screen.recording_mode,
+        )
         self._history.hide()
         self._ocr = (
             OcrOverlayWindow(
@@ -280,7 +283,8 @@ class OverlayApp(QObject):
             else None
         )
         self._ocr_capture_hidden = False
-        self._caption_capture_hidden = False
+        # Window targets hidden for a grab, keyed by overlay.visibility target.
+        self._capture_hidden: set[str] = set()
         # Finals painted while the caption is hidden for a grab; their render
         # acks are sent once the window is back so metrics keeps the row.
         self._pending_final_acks: list[str] = []
@@ -484,8 +488,8 @@ class OverlayApp(QObject):
 
         if event.reason != "capture":
             return
-        if event.target == "caption":
-            self._hide_caption_for_capture(event)
+        if event.target in ("caption", "history"):
+            self._hide_window_for_capture(event)
             return
         if event.visible:
             if self._ocr is not None and self._ocr_capture_hidden:
@@ -503,35 +507,37 @@ class OverlayApp(QObject):
             RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
         )
 
-    def _hide_caption_for_capture(self, event: OverlayVisibilityEvent) -> None:
-        """Hide the caption for a grab; the ack reports where it sits.
+    def _hide_window_for_capture(self, event: OverlayVisibilityEvent) -> None:
+        """Hide the caption or history window for a grab; the ack reports where.
 
-        The caption is capturable in recording mode, so an OCR grab that
-        overlaps it would read the transcript back as slide text. The window is
-        only hidden when it overlaps the captured region, and the ack carries
-        its physical rect so the backend can mask it out of the slide-change
-        score while it is visible between grabs.
+        Both are capturable in recording mode, so an OCR grab that overlaps one
+        of them would read its text back as slide text. A window is only hidden
+        when it overlaps the captured region, and the ack carries its physical
+        rect so the backend can mask it out of the slide-change score while it
+        is visible between grabs.
         """
 
+        window = self._history if event.target == "history" else self._caption
         if event.visible:
-            if self._caption_capture_hidden:
-                self._caption_capture_hidden = False
-                self._caption.show()
-                self._flush_pending_final_acks()
-                self._flush_pending_final_acks()
+            if event.target in self._capture_hidden:
+                self._capture_hidden.discard(event.target)
+                window.show()
+                if event.target == "caption":
+                    self._flush_pending_final_acks()
             return
-        was_visible = self._caption.isVisible()
-        rect = physical_rect_for(self._caption) if was_visible else None
-        self._caption_capture_hidden = bool(
-            was_visible and _overlaps(self._region, rect)
-        )
-        if self._caption_capture_hidden:
-            self._caption.hide()
+        was_visible = window.isVisible()
+        rect = physical_rect_for(window) if was_visible else None
+        hidden = bool(was_visible and _overlaps(self._region, rect))
+        if hidden:
+            self._capture_hidden.add(event.target)
+            window.hide()
+        else:
+            self._capture_hidden.discard(event.target)
         self._send(
             RenderAckCommand(
                 event_id=event.event_id,
                 painted_ts_ms=now_ms(),
-                caption_rect=rect,
+                rect=rect,
             )
         )
 
@@ -549,9 +555,12 @@ class OverlayApp(QObject):
             if ocr is not None:
                 ocr.clear()
             self._ocr_capture_hidden = False
-            if self._caption_capture_hidden:
-                self._caption_capture_hidden = False
-                self._caption.show()
+            if self._capture_hidden:
+                for target in ("history", "caption"):
+                    if target not in self._capture_hidden:
+                        continue
+                    self._capture_hidden.discard(target)
+                    (self._history if target == "history" else self._caption).show()
                 self._flush_pending_final_acks()
         self._caption.set_session_state(event.state)
         self._update_actions()
@@ -571,7 +580,7 @@ class OverlayApp(QObject):
         """Report the paint time for NFR-01 when a final was actually shown."""
 
         if not self._caption.isVisible():
-            if self._caption_capture_hidden:
+            if "caption" in self._capture_hidden:
                 # A capture grab hid the caption; report once it is back so the
                 # metrics row is not lost to the ~100 ms window.
                 self._pending_final_acks.append(event.event_id)

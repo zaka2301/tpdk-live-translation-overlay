@@ -190,16 +190,16 @@ class OverlayVisibilityEvent(Event):
     """Transient overlay hide/show around a screen grab (recording mode).
 
     ``reason == "capture"`` distinguishes this from the user's tray toggle: the
-    UI hides the addressed overlay (the OCR overlay, or the caption when it
-    overlaps the captured region), acknowledges with ``RenderAckCommand`` once
-    the window is off the compositor, and restores its own visibility
-    afterwards. The backend only sends it when
+    UI hides the addressed window (the OCR overlay, or the caption/history
+    window when it overlaps the captured region), acknowledges with
+    ``RenderAckCommand`` once the window is off the compositor, and restores its
+    own visibility afterwards. The backend only sends it when
     ``screen.recording_mode`` is on, so the overlays stay visible to
     OBS/screen shares and the OCR loop still grabs clean pixels.
     """
 
     type: Literal["overlay.visibility"] = "overlay.visibility"
-    target: Literal["ocr", "caption"] = "ocr"
+    target: Literal["ocr", "caption", "history"] = "ocr"
     visible: bool
     reason: Literal["capture"] = "capture"
 
@@ -308,16 +308,16 @@ class SummaryFinalRequestCommand(Command):
 class RenderAckCommand(Command):
     """UI reports when it painted an event; closes the NFR-01 end-to-end loop.
 
-    ``caption_rect`` rides along with the caption hide acknowledgement of a
-    capture guard: it is the caption window's physical rect, which the backend
-    masks out of the slide-change score so a caption repaint never looks like a
-    new slide. Other acks leave it unset.
+    ``rect`` rides along with a capture-hide acknowledgement: the physical rect
+    of the window addressed by that ``overlay.visibility`` event, which the
+    backend masks out of the slide-change score so a caption or history repaint
+    never looks like a new slide. Other acks leave it unset.
     """
 
     type: Literal["render.ack"] = "render.ack"
     event_id: str
     painted_ts_ms: int
-    caption_rect: ScreenRegion | None = None
+    rect: ScreenRegion | None = None
 
 
 class PingCommand(Command):

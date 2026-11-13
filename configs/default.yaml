@@ -80,9 +80,9 @@ screen:
   region: null            # {left, top, width, height} in physical pixels; null = pick in the UI
   capture_interval_ms: 2000
   change_threshold: 0.02  # fraction of pixels that must change to trigger OCR
-  # Recording mode: keep the caption and slide overlay visible to OBS/screen
-  # shares and hide them only around each OCR grab (brief blink when the slide
-  # changes). Leave false to exclude both overlays from capture entirely.
+  # Recording mode: keep the caption, slide overlay, and history visible to
+  # OBS/screen shares and hide them only around each OCR grab (brief blink when
+  # the slide changes). Leave false to exclude all three from capture.
   recording_mode: true
 
 ocr:

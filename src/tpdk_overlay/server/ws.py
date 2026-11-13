@@ -147,7 +147,7 @@ class ConnectionManager:
             orchestrator.record_render_ack(
                 command.event_id,
                 command.painted_ts_ms,
-                command.caption_rect,
+                command.rect,
             )
         else:  # pragma: no cover - contract union is exhaustive
             logger.warning("unhandled command: %s", command.type)

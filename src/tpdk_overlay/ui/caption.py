@@ -1150,9 +1150,19 @@ class HistoryEntry:
 class HistoryWindow(QWidget):
     """Scrollable list of final caption pairs with a markdown export."""
 
-    def __init__(self, ui: UiConfig, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        ui: UiConfig,
+        *,
+        capture_excluded: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
+        self._capture_excluded = bool(capture_excluded)
         self._session_id = ""
+        # Recording mode hides this window around OCR grabs; restoring it must
+        # not pull focus out of the lecture app every time the slide changes.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self._entries: dict[int, HistoryEntry] = {}
         self.setWindowTitle("TPdK caption history")
         self.resize(780, 520)
@@ -1189,6 +1199,13 @@ class HistoryWindow(QWidget):
         layout.addWidget(self._footer)
 
         self._render()
+
+    def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        # The history can sit over the slide region; recording mode leaves it
+        # capturable and the OCR loop hides it around each grab.
+        if self._capture_excluded:
+            exclude_from_capture(self)
 
     @property
     def entry_count(self) -> int:
