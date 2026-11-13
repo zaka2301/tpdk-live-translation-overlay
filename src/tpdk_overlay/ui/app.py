@@ -33,6 +33,7 @@ from tpdk_overlay.contracts import (
     NoticeLevel,
     OcrFrameEvent,
     OverlayToggleCommand,
+    OverlayVisibilityEvent,
     RegionUpdateCommand,
     RenderAckCommand,
     ScreenRegion,
@@ -249,13 +250,17 @@ class OverlayApp(QObject):
         self._history.hide()
         self._ocr = (
             OcrOverlayWindow(
-                config.ui.ocr_overlay, click_through=self._click_through
+                config.ui.ocr_overlay,
+                click_through=self._click_through,
+                capture_excluded=not config.screen.hide_overlay_during_capture,
             )
             if config.ui.ocr_overlay.enabled
             and config.screen.enabled
             and config.ocr.enabled
             else None
         )
+        self._ocr_capture_hidden = False
+        self._ocr_visible = True
 
         self._client = OverlayClient(
             f"ws://{config.server.host}:{config.server.port}/ws", parent=self
@@ -427,6 +432,8 @@ class OverlayApp(QObject):
                 )
         elif isinstance(event, OcrFrameEvent):
             self._on_ocr_frame(event)
+        elif isinstance(event, OverlayVisibilityEvent):
+            self._on_overlay_visibility(event)
 
     def _on_ocr_frame(self, event: OcrFrameEvent) -> None:
         """Paint translated slide blocks and report NFR-03's paint time."""
@@ -438,6 +445,33 @@ class OverlayApp(QObject):
         if not self._ocr.has_content() or not self._ocr.isVisible():
             return
         self._ocr.paint_now()
+        self._send(
+            RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
+        )
+
+    def _on_overlay_visibility(self, event: OverlayVisibilityEvent) -> None:
+        """Hide/show the OCR overlay around the backend's screen grab.
+
+        Recording mode keeps the overlay out of the display affinity so OBS and
+        screen shares capture it; the OCR loop therefore hides it for the few
+        frames it grabs. The ack tells the backend the window is off screen,
+        and the UI restores the user's own visibility state afterwards.
+        """
+
+        if event.reason != "capture":
+            return
+        if event.visible:
+            if self._ocr is not None and self._ocr_capture_hidden:
+                self._ocr_capture_hidden = False
+                if self._ocr.has_content():
+                    self._ocr.show()
+            return
+        if self._ocr is not None:
+            self._ocr_capture_hidden = self._ocr.isVisible()
+            if self._ocr_capture_hidden:
+                self._ocr.hide()
+        # Ack even when there was nothing to hide (no OCR window configured):
+        # the backend waits for it before grabbing a frame.
         self._send(
             RenderAckCommand(event_id=event.event_id, painted_ts_ms=now_ms())
         )
@@ -455,6 +489,7 @@ class OverlayApp(QObject):
             ocr = getattr(self, "_ocr", None)
             if ocr is not None:
                 ocr.clear()
+            self._ocr_capture_hidden = False
         self._caption.set_session_state(event.state)
         self._update_actions()
         self._maybe_auto_start(event.state)
@@ -504,11 +539,12 @@ class OverlayApp(QObject):
             self._send(OverlayToggleCommand(target="caption", visible=visible))
 
     def _set_ocr_visible(self, visible: bool) -> None:
+        self._ocr_visible = bool(visible)
         if self._ocr is not None:
-            self._ocr.set_overlay_visible(visible)
+            self._ocr.set_overlay_visible(self._ocr_visible)
         self._update_actions()
         if self._client.is_connected:
-            self._send(OverlayToggleCommand(target="ocr", visible=visible))
+            self._send(OverlayToggleCommand(target="ocr", visible=self._ocr_visible))
 
     def _set_click_through(self, enabled: bool) -> None:
         self._click_through = bool(enabled)
@@ -628,8 +664,11 @@ class OverlayApp(QObject):
             self._action_visible.setChecked(self._caption.isVisible())
         if self._action_ocr is not None:
             with QSignalBlocker(self._action_ocr):
+                # Intent, not window visibility: the capture handshake hides
+                # the window for a few frames without changing the user's
+                # preference.
                 self._action_ocr.setChecked(
-                    self._ocr is not None and self._ocr.isVisible()
+                    self._ocr is not None and self._ocr_visible
                 )
 
 

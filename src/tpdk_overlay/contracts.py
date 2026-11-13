@@ -186,6 +186,24 @@ class OcrFrameEvent(Event):
     change_ts_ms: int | None = None
 
 
+class OverlayVisibilityEvent(Event):
+    """Transient overlay hide/show around a screen grab (recording mode).
+
+    ``reason == "capture"`` distinguishes this from the user's tray toggle: the
+    UI hides the OCR overlay, acknowledges with ``RenderAckCommand`` once the
+    window is off the compositor, and restores its own visibility afterwards.
+    The backend only sends it when ``screen.hide_overlay_during_capture`` is on,
+    so the overlay stays visible to OBS/screen shares and the OCR loop still
+    grabs clean pixels.
+    """
+
+    type: Literal["overlay.visibility"] = "overlay.visibility"
+    target: Literal["ocr", "caption"] = "ocr"
+    visible: bool
+    reason: Literal["capture"] = "capture"
+
+
+
 class SummaryCheckpointEvent(Event):
     """Partial summary for one checkpoint window.
 
@@ -302,6 +320,7 @@ ServerEvent = Annotated[
     SessionStateEvent
     | TranscriptSegmentEvent
     | OcrFrameEvent
+    | OverlayVisibilityEvent
     | SummaryCheckpointEvent
     | SummaryFinalEvent
     | NoticeEvent
@@ -349,6 +368,7 @@ __all__ = [
     "OcrBlock",
     "OcrFrameEvent",
     "OverlayToggleCommand",
+    "OverlayVisibilityEvent",
     "PingCommand",
     "PongEvent",
     "RegionUpdateCommand",

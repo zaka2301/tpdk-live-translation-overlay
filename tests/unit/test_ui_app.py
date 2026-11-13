@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from tpdk_overlay.config import UiConfig
 from tpdk_overlay.contracts import (
+    OverlayToggleCommand,
     SessionStartCommand,
     SessionState,
     SessionStateEvent,
@@ -105,3 +106,44 @@ def test_start_session_sends_configured_command() -> None:
     assert command.target_lang == "id"
     assert command.checkpoint_interval_s == 300
     assert command.region is None
+
+
+class _Client:
+    is_connected = True
+
+
+class _OcrWindow:
+    def __init__(self) -> None:
+        self.visible: bool | None = None
+
+    def set_overlay_visible(self, visible: bool) -> None:
+        self.visible = visible
+
+
+class _VisibilityState:
+    _set_ocr_visible = OverlayApp._set_ocr_visible
+
+    def __init__(self) -> None:
+        self._ocr = _OcrWindow()
+        self._ocr_visible = True
+        self._client = _Client()
+        self.sent: list[object] = []
+
+    def _update_actions(self) -> None:
+        pass
+
+    def _send(self, command: object) -> None:
+        self.sent.append(command)
+
+
+def test_ocr_visibility_toggle_tracks_intent() -> None:
+    overlay = _VisibilityState()
+
+    overlay._set_ocr_visible(False)
+
+    assert overlay._ocr_visible is False
+    assert overlay._ocr.visible is False
+    command = overlay.sent[-1]
+    assert isinstance(command, OverlayToggleCommand)
+    assert command.target == "ocr"
+    assert command.visible is False

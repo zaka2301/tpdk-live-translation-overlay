@@ -8,13 +8,24 @@ as slide text and every repaint looks like a slide change.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 import pytest
 from PySide6.QtWidgets import QApplication
 
 from tpdk_overlay.config import CaptionConfig, OcrOverlayConfig, UiConfig
-from tpdk_overlay.contracts import BBox, OcrBlock, OcrFrameEvent, ScreenRegion
+from tpdk_overlay.contracts import (
+    BBox,
+    OcrBlock,
+    OcrFrameEvent,
+    OverlayVisibilityEvent,
+    RenderAckCommand,
+    ScreenRegion,
+)
+from tpdk_overlay.pipeline.orchestrator import Orchestrator
 from tpdk_overlay.ui import capture_guard
+from tpdk_overlay.ui.app import OverlayApp
 from tpdk_overlay.ui.caption import CaptionWindow, RegionPicker
 from tpdk_overlay.ui.capture_guard import exclude_from_capture
 from tpdk_overlay.ui.ocr_overlay import OcrOverlayWindow
@@ -184,3 +195,128 @@ def test_caption_can_be_kept_in_recordings(
     caption.close()
 
     assert seen == []
+
+
+class _VisibilityHost:
+    """Binds the app's capture-visibility handler to a real overlay window."""
+
+    _on_overlay_visibility = OverlayApp._on_overlay_visibility
+
+    def __init__(self, ocr: OcrOverlayWindow | None) -> None:
+        self._ocr = ocr
+        self._ocr_capture_hidden = False
+        self.sent: list[object] = []
+
+    def _send(self, command: object) -> None:
+        self.sent.append(command)
+
+
+def test_capture_hide_acks_then_restores_the_overlay(qt_app: QApplication) -> None:
+    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay.show_frame(_frame())
+    qt_app.processEvents()
+    assert overlay.isVisible()
+    host = _VisibilityHost(overlay)
+
+    hide = OverlayVisibilityEvent(target="ocr", visible=False)
+    host._on_overlay_visibility(hide)
+    assert not overlay.isVisible()
+    assert len(host.sent) == 1
+    ack = host.sent[0]
+    assert isinstance(ack, RenderAckCommand)
+    assert ack.event_id == hide.event_id
+
+    host._on_overlay_visibility(OverlayVisibilityEvent(target="ocr", visible=True))
+    assert overlay.isVisible()
+    overlay.close()
+
+
+def test_capture_show_keeps_a_user_hidden_overlay_hidden(
+    qt_app: QApplication,
+) -> None:
+    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay.show_frame(_frame())
+    overlay.set_overlay_visible(False)
+    host = _VisibilityHost(overlay)
+
+    host._on_overlay_visibility(
+        OverlayVisibilityEvent(target="ocr", visible=False)
+    )
+    host._on_overlay_visibility(OverlayVisibilityEvent(target="ocr", visible=True))
+
+    assert not overlay.isVisible()
+    overlay.close()
+
+
+def test_recording_mode_leaves_the_overlay_capturable(
+    qt_app: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(
+        "tpdk_overlay.ui.ocr_overlay.exclude_from_capture",
+        lambda widget: seen.append(type(widget).__name__) or True,
+    )
+    overlay = OcrOverlayWindow(OcrOverlayConfig(font_size=10), capture_excluded=False)
+    overlay.show_frame(_frame())
+    qt_app.processEvents()
+    overlay.close()
+
+    assert seen == []
+
+
+def _orchestrator_stub() -> Orchestrator:
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._capture_ack_lock = threading.Lock()
+    orchestrator._capture_ack_waiters = {}
+    orchestrator._metrics = None
+    orchestrator._stop_event = threading.Event()
+    return orchestrator
+
+
+def test_capture_ack_wakes_the_ocr_thread() -> None:
+    orchestrator = _orchestrator_stub()
+    event = OverlayVisibilityEvent(target="ocr", visible=False)
+    published: list[OverlayVisibilityEvent] = []
+    orchestrator._publish = published.append
+
+    def ack() -> None:
+        while not published:
+            time.sleep(0.001)
+        orchestrator.record_render_ack(event.event_id, 123)
+
+    thread = threading.Thread(target=ack)
+    thread.start()
+    try:
+        assert orchestrator._await_render_ack(event, 1.0) is True
+    finally:
+        thread.join()
+
+
+def test_capture_ack_times_out_without_a_client() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._publish = lambda event: None
+    event = OverlayVisibilityEvent(target="ocr", visible=False)
+
+    assert orchestrator._await_render_ack(event, 0.05) is False
+
+
+def test_hide_request_is_acked_without_an_ocr_window() -> None:
+    host = _VisibilityHost(None)
+    hide = OverlayVisibilityEvent(target="ocr", visible=False)
+
+    host._on_overlay_visibility(hide)
+
+    assert len(host.sent) == 1
+    assert host.sent[0].event_id == hide.event_id
+
+
+def test_capture_ack_aborts_on_stop() -> None:
+    orchestrator = _orchestrator_stub()
+    orchestrator._publish = lambda event: None
+    orchestrator._stop_event.set()
+    event = OverlayVisibilityEvent(target="ocr", visible=False)
+
+    started = time.monotonic()
+    assert orchestrator._await_render_ack(event, 5.0) is False
+
+    assert time.monotonic() - started < 0.5

@@ -65,6 +65,7 @@ class OcrOverlayWindow(QWidget):
         config: OcrOverlayConfig,
         *,
         click_through: bool = True,
+        capture_excluded: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -75,6 +76,7 @@ class OcrOverlayWindow(QWidget):
         )
         self._config = config
         self._click_through = bool(click_through)
+        self._capture_excluded = bool(capture_excluded)
         self._visible = True
         self._frame: OcrFrameEvent | None = None
         self._region: ScreenRegion | None = None
@@ -211,10 +213,11 @@ class OcrOverlayWindow(QWidget):
     def showEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
         # The overlay covers the captured region. Exclude it from the grab so
-        # the OCR loop reads the slide, not its own translations. Re-assert on
-        # every show: a hidden/show cycle or a re-created handle would
-        # otherwise leave the fresh window capturable.
-        exclude_from_capture(self)
+        # the OCR loop reads the slide, not its own translations. Recording
+        # mode (capture_excluded=False) leaves it capturable and the OCR loop
+        # hides it around each grab instead.
+        if self._capture_excluded:
+            exclude_from_capture(self)
 
     def mousePressEvent(self, event: object) -> None:  # noqa: N802 - Qt naming
         if self._click_through or event.button() != Qt.MouseButton.LeftButton:

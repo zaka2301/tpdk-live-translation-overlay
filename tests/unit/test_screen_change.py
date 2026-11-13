@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from tpdk_overlay.config import ScreenConfig
+from tpdk_overlay.contracts import BBox
 from tpdk_overlay.screen.change import SlideChangeDetector
 
 
@@ -69,3 +70,47 @@ def test_shape_change_is_treated_as_a_new_slide() -> None:
     detector.score(_frame())
 
     assert detector.score(_frame(height=400)) == 1.0
+
+
+def test_masked_overlay_repaint_is_not_a_slide_change() -> None:
+    detector = SlideChangeDetector(ScreenConfig(change_threshold=0.02))
+    frame = _frame()
+    detector.score(frame)
+
+    painted = frame.copy()
+    painted[100:140, 40:300] = 20  # overlay panel over the first text block
+    mask = BBox(x=40, y=100, w=260, h=40)
+
+    assert detector.score(painted, mask=[mask]) == 0.0
+
+
+def test_change_outside_the_mask_still_triggers() -> None:
+    detector = SlideChangeDetector(ScreenConfig(change_threshold=0.02))
+    frame = _frame()
+    detector.score(frame)
+
+    painted = frame.copy()
+    painted[100:140, 40:300] = 20  # overlay panel (masked)
+    painted[250:330, 400:620] = 255  # new slide content (not masked)
+    mask = BBox(x=40, y=100, w=260, h=40)
+
+    assert detector.score(painted, mask=[mask]) > 0.02
+
+
+def test_fully_masked_frame_scores_zero() -> None:
+    detector = SlideChangeDetector(ScreenConfig())
+    frame = _frame()
+    detector.score(np.zeros_like(frame))
+
+    assert detector.score(frame, mask=[BBox(x=0, y=0, w=640, h=360)]) == 0.0
+
+
+def test_remember_replaces_the_reference_frame() -> None:
+    detector = SlideChangeDetector(ScreenConfig())
+    frame = _frame()
+    detector.score(frame)
+    changed = frame.copy()
+    changed[250:330, 400:620] = 255
+    detector.remember(changed)
+
+    assert detector.score(changed.copy()) == 0.0

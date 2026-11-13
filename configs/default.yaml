@@ -80,6 +80,10 @@ screen:
   region: null            # {left, top, width, height} in physical pixels; null = pick in the UI
   capture_interval_ms: 1000
   change_threshold: 0.02  # fraction of pixels that must change to trigger OCR
+  # Recording mode: keep the overlay visible to OBS/screen shares and hide it
+  # only around each OCR grab (brief blink when the slide changes). Leave false
+  # to exclude the overlay from capture entirely.
+  hide_overlay_during_capture: false
 
 ocr:
   enabled: true

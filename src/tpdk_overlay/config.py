@@ -158,6 +158,10 @@ class ScreenConfig(_Section):
     region: ScreenRegion | None = None
     capture_interval_ms: int = Field(default=1000, ge=100)
     change_threshold: float = Field(default=0.02, ge=0.0, le=1.0)
+    # Recording mode: leave the overlay capturable by OBS/screen shares and
+    # hide it only for the instant the OCR loop grabs the region (a brief blink
+    # when the slide changes). The default excludes it from capture instead.
+    hide_overlay_during_capture: bool = False
 
 
 class OcrConfig(_Section):

@@ -27,6 +27,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -39,10 +40,12 @@ from tpdk_overlay.asr.errors import AsrTimeout, AsrUnavailable
 from tpdk_overlay.audio.vad import VAD_FRAME_MS, VAD_FRAME_SAMPLES, SpeechStart, Utterance
 from tpdk_overlay.config import AppConfig
 from tpdk_overlay.contracts import (
+    BBox,
     NoticeEvent,
     NoticeLevel,
     OcrBlock,
     OcrFrameEvent,
+    OverlayVisibilityEvent,
     ScreenRegion,
     SegmentStatus,
     SessionStartCommand,
@@ -65,6 +68,7 @@ from tpdk_overlay.ports import (
     AudioSource,
     CheckpointSummaryRequest,
     FinalSummaryRequest,
+    ImageArray,
     OcrEngine,
     OcrLine,
     ScreenSource,
@@ -90,6 +94,11 @@ _STOP_BUDGET_S = 3.0
 _PUT_BUDGET_S = 5.0
 _MT_POLL_S = 0.2
 _OCR_IDLE_WAIT_S = 0.2
+# Recording mode: wait at most 1 s for the UI to confirm the OCR overlay is
+# hidden, then give the compositor ~3 frames to actually drop the window before
+# grabbing the screen. Without the settle, BitBlt can still see the old frame.
+_CAPTURE_HIDE_TIMEOUT_S = 1.0
+_CAPTURE_SETTLE_S = 0.05
 # Send audio to the ASR worker in 0.25 s chunks instead of 32 ms frames: a
 # bounded queue then holds ~2 s of audio before it applies backpressure.
 _ASR_CHUNK_SAMPLES = 4_000
@@ -262,6 +271,12 @@ class Orchestrator:
 
         self._region_override: ScreenRegion | None = None
         self._overlay_visibility: dict[str, bool] = {"ocr": True, "caption": True}
+        # Recording mode: the last two painted frames' boxes mask the OCR
+        # overlay out of the slide-change score, and the capture grab waits for
+        # a render.ack before it trusts the screen.
+        self._recent_frame_rects: deque[tuple[BBox, ...]] = deque(maxlen=2)
+        self._capture_ack_lock = threading.Lock()
+        self._capture_ack_waiters: dict[str, threading.Event] = {}
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._startup_task: asyncio.Task[None] | None = None
@@ -529,9 +544,16 @@ class Orchestrator:
         """Remember the UI's local caption/OCR visibility toggle."""
 
         self._overlay_visibility[target] = visible
+        if target == "ocr" and not visible:
+            # A hidden overlay cannot contaminate the grab; stop masking.
+            self._recent_frame_rects.clear()
         logger.debug("overlay %s visibility -> %s", target, visible)
 
     def record_render_ack(self, event_id: str, painted_ts_ms: int) -> None:
+        with self._capture_ack_lock:
+            waiter = self._capture_ack_waiters.pop(event_id, None)
+        if waiter is not None:
+            waiter.set()
         if self._metrics is not None:
             self._metrics.ack(event_id, painted_ts_ms)
 
@@ -1341,10 +1363,21 @@ class Orchestrator:
         image = ports.screen_source.capture(region)
         change_ts_ms = now_ms()
         score = 1.0
+        mask = self._capture_mask()
         if ports.change_detector is not None:
-            score = float(ports.change_detector.score(image))
+            score = float(ports.change_detector.score(image, mask=mask))
         if score < self._config.screen.change_threshold:
             return
+
+        if mask:
+            # Recording mode: the grab contains our own overlay, so OCR needs a
+            # second, clean frame with the overlay hidden for this instant.
+            clean = self._capture_with_overlay_hidden(region, ports)
+            if clean is None:
+                return
+            if ports.change_detector is not None:
+                ports.change_detector.remember(clean)
+            image = clean
 
         stopwatch = Stopwatch()
         lines = ports.ocr_engine.recognize(image)
@@ -1400,6 +1433,13 @@ class Orchestrator:
             change_ts_ms=change_ts_ms,
         )
         self._publish(event)
+        if self._config.screen.hide_overlay_during_capture:
+            if blocks:
+                # Mask these panels out of the next change score; the previous
+                # frame's boxes stay for one pass because paint lags the emit.
+                self._recent_frame_rects.append(tuple(block.bbox for block in blocks))
+            else:
+                self._recent_frame_rects.clear()
         # An empty frame carries no paintable content; it exists so the UI
         # clears boxes left over from the previous slide.
         if self._metrics is not None and blocks:
@@ -1414,6 +1454,72 @@ class Orchestrator:
                     "checkpointed": False,
                 }
             )
+
+    def _capture_mask(self) -> tuple[BBox, ...]:
+        """Overlay boxes to ignore in the slide-change score (recording mode)."""
+
+        if not self._config.screen.hide_overlay_during_capture:
+            return ()
+        return tuple(bbox for rects in self._recent_frame_rects for bbox in rects)
+
+    def _capture_with_overlay_hidden(
+        self, region: ScreenRegion, ports: PipelinePorts
+    ) -> ImageArray | None:
+        """Grab the slide with the OCR overlay hidden just for the instant.
+
+        ``screen.hide_overlay_during_capture`` keeps the overlay capturable, so
+        OBS and screen shares show it. The OCR loop asks the UI to hide it
+        before the grab and restores it right after; the window is missing for
+        ~50 ms, which a recording shows as one or two frames when the slide
+        changes. Returns ``None`` when the UI does not acknowledge (no client,
+        or a stalled one): OCRing that grab would feed the overlay's own
+        translations back as slide text.
+        """
+
+        assert ports.screen_source is not None
+        request = OverlayVisibilityEvent(
+            session_id=self.session_id, target="ocr", visible=False
+        )
+        if not self._await_render_ack(request, _CAPTURE_HIDE_TIMEOUT_S):
+            logger.warning(
+                "overlay hide was not acknowledged; skipping this OCR pass"
+            )
+            return None
+        try:
+            # Composition lands one frame after the hide; grab after it does.
+            time.sleep(_CAPTURE_SETTLE_S)
+            return ports.screen_source.capture(region)
+        finally:
+            self._publish(
+                OverlayVisibilityEvent(
+                    session_id=self.session_id, target="ocr", visible=True
+                )
+            )
+
+    def _await_render_ack(
+        self, event: OverlayVisibilityEvent, timeout_s: float
+    ) -> bool:
+        """Publish ``event`` and wait until the UI acknowledges it.
+
+        The wait polls ``_stop_event`` so a session stop is not held up by the
+        full timeout when the UI is gone.
+        """
+
+        waiter = threading.Event()
+        with self._capture_ack_lock:
+            self._capture_ack_waiters[event.event_id] = waiter
+        try:
+            self._publish(event)
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop_event.is_set():
+                    return False
+                if waiter.wait(min(0.05, remaining)):
+                    return True
+        finally:
+            with self._capture_ack_lock:
+                self._capture_ack_waiters.pop(event.event_id, None)
 
     def _group_blocks(
         self, lines: Sequence[OcrLine], ports: PipelinePorts
@@ -1616,6 +1722,11 @@ class Orchestrator:
         self._checkpoint_markdowns.clear()
         self._checkpoint_id = 0
         self._last_checkpoint_to_ms = 0
+        self._recent_frame_rects.clear()
+        with self._capture_ack_lock:
+            for waiter in self._capture_ack_waiters.values():
+                waiter.set()
+            self._capture_ack_waiters.clear()
 
     def _transition(self, state: SessionState, detail: str | None = None) -> None:
         self._state = state

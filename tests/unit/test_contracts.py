@@ -8,6 +8,7 @@ from tpdk_overlay.contracts import (
     NoticeEvent,
     OcrBlock,
     OcrFrameEvent,
+    OverlayVisibilityEvent,
     PingCommand,
     PongEvent,
     ScreenRegion,
@@ -65,6 +66,17 @@ def test_ocr_frame_roundtrip() -> None:
     assert parsed == event
     assert parsed.region.left == -1920
     assert parsed.blocks[0].bbox.w == 300
+
+
+def test_overlay_visibility_roundtrip() -> None:
+    event = OverlayVisibilityEvent(target="ocr", visible=False)
+
+    parsed = parse_server_event(event.model_dump_json())
+
+    assert isinstance(parsed, OverlayVisibilityEvent)
+    assert parsed.target == "ocr"
+    assert parsed.visible is False
+    assert parsed.reason == "capture"
 
 
 def test_bbox_rejects_zero_size() -> None:
